@@ -758,8 +758,11 @@ void RegisterWorker(const char* name) {
 }
 
 void SampleCpu(unsigned core, unsigned long long thread, unsigned long long pc, unsigned svc, unsigned fpcr) {
+    // Switch 2 titles run six cores: those past the first four are not sampled, as the other
+    // per-core counters skip them (eden_jit_compile, eden_jit_phases).
+    if (core >= sampled_epoch.size()) return;
     const auto epoch = sample_epoch.load(std::memory_order_relaxed);
-    if (sampled_epoch.at(core) == epoch) return;
+    if (sampled_epoch[core] == epoch) return;
     sampled_epoch[core] = epoch;
     const CpuSample sample{epoch, ClockNs(CLOCK_MONOTONIC),
         owner_cpu_clock_valid ? ClockNs(CLOCK_THREAD_CPUTIME_ID) : -ENOTSUP, thread, pc, svc, fpcr,
