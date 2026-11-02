@@ -1603,19 +1603,15 @@ if(EDEN_DEV_PROFILE)
         worker_task_manager.WaitForRequests();
         eden_mark("worker_tasks");]=])
     eden_patch_kernel([=[        CloseServices();
-
-        if (application_process) {
-            application_process->Close(system.Kernel());
-            application_process = nullptr;
-        }
 ]=] [=[        CloseServices();
         eden_mark("close_services");
-
-        if (application_process) {
-            application_process->Close(system.Kernel());
-            application_process = nullptr;
-        }
+]=])
+    # The application process's release (and its arena clearing) ends before the IDs reset.
+    eden_patch_kernel([=[
+        next_object_id = 0;
+]=] [=[
         eden_mark("application_process");
+        next_object_id = 0;
 ]=])
     eden_patch_kernel([=[        CleanupObject(system_resource_limit);
 ]=] [=[        CleanupObject(system_resource_limit);
