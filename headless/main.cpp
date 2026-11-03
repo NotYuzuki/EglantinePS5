@@ -712,7 +712,14 @@ int main(int argc, char** argv) {
             Common::Log::Filter filter;
             filter.SetClassLevel(Common::Log::Class::Service_FS, Common::Log::Level::Info);
 #if defined(PS5_NATIVE) && !defined(EDEN_DEV_PROFILE) && !defined(EDEN_DEV_ROM_ID)
-            if (Eden::LoadPreferences().detailed_logging) filter.ParseFilterString("*:Debug");
+            if (Eden::LoadPreferences().detailed_logging) {
+                filter.ParseFilterString("*:Debug");
+                // Every native (Switch 2) program the session captures, kept once by its key in
+                // logs/native-shaders (EDEN_NX2_SHADER_DUMP, read when the first one is lowered),
+                // so a program the lowering rejects can be studied off the console.
+                const std::string shaders = Eden::LogsDir() + "/native-shaders";
+                setenv("EDEN_NX2_SHADER_DUMP", shaders.c_str(), 1);
+            }
 #endif
 #ifdef PS5_NATIVE
             // The settings below hold in development builds too, so that what they measure is what
