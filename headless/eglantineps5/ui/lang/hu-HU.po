@@ -2353,3 +2353,11 @@ msgstr "{0}/ (NSP vagy XCI)"
 #: pe/ui/browse.cpp
 msgid "{0}/ (one folder per game ID)"
 msgstr "{0}/ (játékazonosítónként egy mappa)"
+
+#: pe/ui/game_options.cpp pe/ui/settings.cpp
+msgid "30 FPS limit"
+msgstr "30 FPS-es korlát"
+
+#: pe/ui/settings.cpp
+msgid "30 FPS LIMIT"
+msgstr "30 FPS-ES KORLÁT"

@@ -1076,6 +1076,18 @@ int main(int argc, char** argv) {
             if (speed.unsafe_dma) Settings::values.dma_accuracy.SetValue(Settings::DmaAccuracy::Unsafe);
             Settings::values.use_reactive_flushing.SetValue(speed.reactive_flushing);
             Settings::values.skip_cpu_inner_invalidation.SetValue(speed.skip_invalidation);
+            // 30 FPS limit: presents held to 30 a second (eglantine patch 0039). A rate set beforehand
+            // (dev-settings env=EDEN_NX2_PRESENT_HZ=...) stays when the switch is off.
+            {
+                static bool limit_set = false;
+                if (speed.fps_30) {
+                    setenv("EDEN_NX2_PRESENT_HZ", "30", 1);
+                    limit_set = true;
+                } else if (limit_set) {
+                    unsetenv("EDEN_NX2_PRESENT_HZ");
+                    limit_set = false;
+                }
+            }
             // The block list is off unless the settings turn it on (block-list.txt in the app
             // folder still does, further down).
             if (!dev_block_list) Eden::JitList::enabled = speed.block_list;
@@ -1090,7 +1102,8 @@ int main(int argc, char** argv) {
                                     on(Settings::values.dma_accuracy.GetValue() == Settings::DmaAccuracy::Unsafe) +
                                     ", reactive flushing " + on(Settings::values.use_reactive_flushing.GetValue()) +
                                     ", skip invalidation " +
-                                    on(Settings::values.skip_cpu_inner_invalidation.GetValue())).c_str());
+                                    on(Settings::values.skip_cpu_inner_invalidation.GetValue()) +
+                                    ", 30 fps limit " + on(speed.fps_30)).c_str());
             // What a crash report says was running.
             char title_id[20];
             std::snprintf(title_id, sizeof(title_id), "%016llx",

@@ -2353,3 +2353,11 @@ msgstr "{0}/(NSP 또는 XCI)"
 #: pe/ui/browse.cpp
 msgid "{0}/ (one folder per game ID)"
 msgstr "{0}/(타이틀 ID마다 폴더 하나)"
+
+#: pe/ui/game_options.cpp pe/ui/settings.cpp
+msgid "30 FPS limit"
+msgstr "30 FPS 제한"
+
+#: pe/ui/settings.cpp
+msgid "30 FPS LIMIT"
+msgstr "30 FPS 제한"

@@ -2353,3 +2353,11 @@ msgstr "{0}/ (NSP eller XCI)"
 #: pe/ui/browse.cpp
 msgid "{0}/ (one folder per game ID)"
 msgstr "{0}/ (en mapp per titel-ID)"
+
+#: pe/ui/game_options.cpp pe/ui/settings.cpp
+msgid "30 FPS limit"
+msgstr "Gräns på 30 FPS"
+
+#: pe/ui/settings.cpp
+msgid "30 FPS LIMIT"
+msgstr "GRÄNS PÅ 30 FPS"

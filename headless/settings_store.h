@@ -14,7 +14,7 @@
 //     "diagnostics": { "detailed_logging": false, "immediate_logs": false },
 //     "performance": { "block_list": false, "async_shaders": false, "fast_gpu": false,
 //                      "unsafe_cpu": false, "unsafe_dma": false, "reactive_flushing": true,
-//                      "skip_invalidation": false },
+//                      "skip_invalidation": false, "fps_30": false },
 //     "game_files": "/mnt/ext1/eden",
 //     "library": { "last_game": "Game [id].nsp", "recent": ["Game [id].nsp"] },
 //     "games": { "0100000000010000": { "console_mode": "handheld", "renderer": "opengl",
@@ -432,7 +432,8 @@ inline bool SaveGameDocked(uint64_t title_id, bool docked, const std::string& fi
 
 // The Performance switches by name, in the order of PerformanceSettings and of the launcher.
 inline constexpr const char* kPerformanceKeys[] = {"block_list", "async_shaders", "fast_gpu", "unsafe_cpu",
-                                                   "unsafe_dma", "reactive_flushing", "skip_invalidation"};
+                                                   "unsafe_dma", "reactive_flushing", "skip_invalidation",
+                                                   "fps_30"};
 inline constexpr int kPerformanceSwitches = int(std::size(kPerformanceKeys));
 
 // Library > Game settings: what one game does differently from Settings. Each value is -1 (absent
@@ -454,7 +455,7 @@ struct GameSettings {
     int controller = -1;        // index into kControllerKeys
     bool own_mapping = false;   // the game has a button mapping of its own: mapping
     ButtonMapping mapping = kDefaultMapping;
-    std::array<int, kPerformanceSwitches> performance{-1, -1, -1, -1, -1, -1, -1};  // kPerformanceKeys
+    std::array<int, kPerformanceSwitches> performance{-1, -1, -1, -1, -1, -1, -1, -1};  // kPerformanceKeys
     int64_t rng_seed = -1;      // 0 to 4294967295, or -1: no seed (load_address.h)
 };
 // The seed a typed text names: digits and nothing else, 0 to 4294967295. -1 for any other text.
@@ -611,6 +612,7 @@ struct PerformanceSettings {
     bool unsafe_dma = false;     // Eden's unsafe DMA accuracy
     bool reactive_flushing = true;   // Eden's reactive flushing: off is faster, some effects break
     bool skip_invalidation = false;  // Eden's skip_cpu_inner_invalidation: fewer cache invalidations
+    bool fps_30 = false;             // presents held to 30 a second (EDEN_NX2_PRESENT_HZ, eglantine patch 0039)
 };
 
 inline PerformanceSettings LoadPerformance(uint64_t title_id, const std::string& file = SettingsFile()) {
@@ -628,6 +630,7 @@ inline PerformanceSettings LoadPerformance(uint64_t title_id, const std::string&
         value("unsafe_dma", result.unsafe_dma);
         value("reactive_flushing", result.reactive_flushing);
         value("skip_invalidation", result.skip_invalidation);
+        value("fps_30", result.fps_30);
     };
     read("");
     if (title_id) read("/games/" + Settings::TitleKey(title_id));
@@ -644,7 +647,7 @@ inline bool SavePerformance(uint64_t title_id, const PerformanceSettings& value,
     owner["performance"] = {{"block_list", value.block_list}, {"async_shaders", value.async_shaders},
                             {"fast_gpu", value.fast_gpu}, {"unsafe_cpu", value.unsafe_cpu},
                             {"unsafe_dma", value.unsafe_dma}, {"reactive_flushing", value.reactive_flushing},
-                            {"skip_invalidation", value.skip_invalidation}};
+                            {"skip_invalidation", value.skip_invalidation}, {"fps_30", value.fps_30}};
     return Settings::Write(document, file);
 }
 

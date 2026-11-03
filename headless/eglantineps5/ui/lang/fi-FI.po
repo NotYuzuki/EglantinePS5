@@ -2353,3 +2353,11 @@ msgstr "{0}/ (NSP tai XCI)"
 #: pe/ui/browse.cpp
 msgid "{0}/ (one folder per game ID)"
 msgstr "{0}/ (kansio kutakin nimiketunnusta kohden)"
+
+#: pe/ui/game_options.cpp pe/ui/settings.cpp
+msgid "30 FPS limit"
+msgstr "30 FPS:n raja"
+
+#: pe/ui/settings.cpp
+msgid "30 FPS LIMIT"
+msgstr "30 FPS:N RAJA"

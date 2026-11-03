@@ -468,17 +468,17 @@ void pictures(Stage &s)
         const auto states = [&s]
         {
             const pe::ui::Preferences p = s.services.preferences();
-            return std::array<bool, 7>{p.block_list, p.async_shaders, p.fast_gpu, p.unsafe_cpu,
-                                       p.unsafe_dma, p.reactive_flushing, p.skip_invalidation};
+            return std::array<bool, 8>{p.block_list, p.async_shaders, p.fast_gpu, p.unsafe_cpu,
+                                       p.unsafe_dma, p.reactive_flushing, p.skip_invalidation, p.fps_30};
         };
-        const std::array<bool, 7> start = states();
-        bool reached = start == std::array<bool, 7>{false, false, false, false, false, true, false};
+        const std::array<bool, 8> start = states();
+        bool reached = start == std::array<bool, 8>{false, false, false, false, false, true, false, false};
         for (std::size_t row = 0; row < start.size(); ++row)
         {
             if (row != 0)
                 s.press({Key::down});
             s.press({Key::cross});
-            std::array<bool, 7> expected = start;
+            std::array<bool, 8> expected = start;
             for (std::size_t changed = 0; changed <= row; ++changed)
                 expected[changed] = !start[changed];
             reached = reached && states() == expected;
@@ -488,7 +488,7 @@ void pictures(Stage &s)
                 s.shoot("47-performance-changed");
             }
         }
-        // The seventh row: the list scrolled to it.
+        // The last row: the list scrolled to it.
         s.wait(0.6f);
         s.shoot("48-performance-scrolled");
         if (!reached)

@@ -2445,3 +2445,11 @@ msgstr "Calculando el tiempo"
 #: pe/ui/remote.cpp
 msgid "The reading you cancelled is still ending. Its files are kept; try again in a moment."
 msgstr "La lectura que cancelaste aún está terminando. Sus archivos se guardan; intenta de nuevo en un momento."
+
+#: pe/ui/game_options.cpp pe/ui/settings.cpp
+msgid "30 FPS limit"
+msgstr "Límite de 30 FPS"
+
+#: pe/ui/settings.cpp
+msgid "30 FPS LIMIT"
+msgstr "LÍMITE DE 30 FPS"
