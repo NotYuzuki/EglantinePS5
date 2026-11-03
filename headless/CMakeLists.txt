@@ -920,7 +920,7 @@ if(EDEN_DEV_PROFILE)
     list(REMOVE_ITEM core_sources "hle/service/service.cpp")
     list(APPEND core_sources "${PORT_BUILD_DIR}/hle_service.cpp")
     file(READ "${PROJECT_SOURCE_DIR}/src/core/hle/kernel/svc/svc_ipc.cpp" ipc_source)
-    set(ipc_old "    R_RETURN(session->SendSyncRequest(kernel, message, buffer_size));")
+    set(ipc_old "    const Result result = session->SendSyncRequest(kernel, message, buffer_size);")
     string(FIND "${ipc_source}" "${ipc_old}" ipc_at)
     if(ipc_at LESS 0)
         message(FATAL_ERROR "Pinned SendSyncRequest changed")
@@ -928,21 +928,24 @@ if(EDEN_DEV_PROFILE)
     # Which guest thread is waiting, not only how long the waits summed to: a frame held up by one
     # thread and a frame with a dozen idle helpers reporting the same total look identical without
     # this, and only one of them can be costing the frame (performance.h).
+    # Include the core's pending-started-thread wait in the guest's IPC latency.
+    # A scope exit preserves both that wait and the original result/return path.
     string(REPLACE "${ipc_old}" [=[    const auto ipc_start = ::Eden::Performance::NowNs();
-    const Result ipc_result = session->SendSyncRequest(kernel, message, buffer_size);
-    const long long ipc_ns = ::Eden::Performance::NowNs() - ipc_start;
-    ::Eden::Performance::AddNs(::Eden::Performance::guest_ipc_wait, ipc_ns);
-    {
-        bool fresh = false;
-        const unsigned ipc_slot =
-            ::Eden::Performance::IpcThreadSlotFor(GetCurrentThread(kernel).GetThreadId(), &fresh);
-        if (fresh) {
-            if (const auto ipc_name = Core::GetThreadName(&GetCurrentThread(kernel)))
-                ::Eden::Performance::SetIpcThreadName(ipc_slot, ipc_name->c_str());
+    SCOPE_EXIT {
+        const long long ipc_ns = ::Eden::Performance::NowNs() - ipc_start;
+        ::Eden::Performance::AddNs(::Eden::Performance::guest_ipc_wait, ipc_ns);
+        {
+            bool fresh = false;
+            const unsigned ipc_slot =
+                ::Eden::Performance::IpcThreadSlotFor(GetCurrentThread(kernel).GetThreadId(), &fresh);
+            if (fresh) {
+                if (const auto ipc_name = Core::GetThreadName(&GetCurrentThread(kernel)))
+                    ::Eden::Performance::SetIpcThreadName(ipc_slot, ipc_name->c_str());
+            }
+            ::Eden::Performance::AddIpcThread(ipc_slot, ipc_ns);
         }
-        ::Eden::Performance::AddIpcThread(ipc_slot, ipc_ns);
-    }
-    R_RETURN(ipc_result);]=] ipc_source "${ipc_source}")
+    };
+    const Result result = session->SendSyncRequest(kernel, message, buffer_size);]=] ipc_source "${ipc_source}")
     write_derived("${PORT_BUILD_DIR}/svc_ipc.cpp" "#include \"${EDEN_PORT_DIR}/performance.h\"\n#include \"core/arm/debug.h\"\n${ipc_source}")
     list(REMOVE_ITEM core_sources "hle/kernel/svc/svc_ipc.cpp")
     list(APPEND core_sources "${PORT_BUILD_DIR}/svc_ipc.cpp")
