@@ -43,8 +43,10 @@ void SparseUsage(std::size_t* reserved, std::size_t* committed) noexcept;
 
 namespace Eden::Performance {
 namespace {
+// Guest cores 4 and 5 come last: the indices before them are also guest core numbers and the
+// GPU thread's sampler slot (4).
 constexpr std::array names{"CPUCore_0", "CPUCore_1", "CPUCore_2", "CPUCore_3",
-                           "GPU", "HostTiming", "VSyncThread"};
+                           "GPU", "HostTiming", "VSyncThread", "CPUCore_4", "CPUCore_5"};
 struct Worker {
     pthread_t thread{};
     clockid_t clock{};
@@ -150,41 +152,78 @@ void PcSignal(int, siginfo_t*, void* context) {
 }
 #endif
 #ifdef PS5_NATIVE
-std::array<unsigned, 5> worker_cpus{};
+// Pinned CPU of each entry of names, -1 for none. Guest cores 0-3 and the GPU thread get distinct
+// physical cores, guest cores 4 and 5 two more when the process has them (pin_order). Those two
+// run game workers only in Switch 2 titles (Switch 1 titles leave them idle), so they take their
+// CPUs only while one is loaded (ReserveSwitch2Cores) and Switch 1 titles keep them as secondary.
+std::array<int, names.size()> worker_cpus = [] { std::array<int, names.size()> c{}; c.fill(-1); return c; }();
+constexpr std::array<unsigned, 7> pin_order{0, 1, 2, 3, 4, 7, 8};
+constexpr bool Switch2Core(unsigned index) { return index >= 7; }
 bool worker_topology_ready = false;
-// Physical core (x2APIC above the SMT shift) of each allowed CPU, -1 if unknown.
+std::atomic<bool> switch2_cores{false};
+// Physical core of each probed CPU, -1 if unknown.
 std::array<int, 64> cpu_core = [] { std::array<int, 64> c{}; c.fill(-1); return c; }();
-// CPUs outside guest cores 0-2 and their SMT siblings, and not the GPU thread CPU.
-unsigned long long secondary_cpus = 0;
-// The process CPU set seen by the topology probe (threads may inherit narrower sets).
+// CPUs outside guest cores 0-2 and their SMT siblings, and not the CPUs of guest core 3 and the GPU
+// thread; for a Switch 2 title not those of guest cores 4 and 5 either.
+unsigned long long secondary_switch1 = 0, secondary_switch2 = 0;
+std::atomic<unsigned long long> secondary_cpus{0};
+// The CPUs the topology probe could run on (threads may inherit narrower sets).
 cpuset_t topology_allowed{};
 bool topology_allowed_valid = false;
 std::atomic<bool> placement_secondary{false};
 std::atomic<unsigned> secondary_reports{};
+unsigned long long CpuBits(const cpuset_t& set) {
+    unsigned long long bits = 0;
+    for (unsigned cpu = 0; cpu < 64; ++cpu)
+        if (CPU_ISSET(cpu, &set)) bits |= 1ULL << cpu;
+    return bits;
+}
+cpuset_t CpuSet(unsigned long long bits) {
+    cpuset_t set{};
+    for (unsigned cpu = 0; cpu < 64; ++cpu)
+        if (bits & (1ULL << cpu)) CPU_SET(cpu, &set);
+    return set;
+}
 void CheckWorkerTopology() {
-    cpuset_t original{};
-    if (__get_cpuid_max(0, nullptr) < 0xb ||
-        cpuset_getaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1, 8, &original)) return;
-    std::array<unsigned, 5> cores{};
-    unsigned count = 0;
-    bool changed = false;
+    cpuset_t original{}, process{};
+    worker_cpus.fill(-1);
+    cpu_core.fill(-1);
+    worker_topology_ready = false;
+    secondary_switch1 = secondary_switch2 = 0;
+    secondary_cpus.store(0, std::memory_order_relaxed);
+    if (cpuset_getaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1, 8, &original)) return;
+    // The main thread may start with a narrower set than its process: probe the process's too.
+    const bool process_valid = !cpuset_getaffinity(CPU_LEVEL_CPUSET, CPU_WHICH_PID, -1, 8, &process);
+    const unsigned long long thread_mask = CpuBits(original), process_mask = process_valid ? CpuBits(process) : 0;
+    unsigned long long probed = 0, failed = 0;
+    bool cpuid_usable = __get_cpuid_max(0, nullptr) >= 0xb, changed = false;
+    std::array<long long, 64> apic_id{};
+    apic_id.fill(-1);
     for (unsigned cpu = 0; cpu < 64; ++cpu) {
-        if (!CPU_ISSET(cpu, &original)) continue;
+        if (!((thread_mask | process_mask) & (1ULL << cpu))) continue;
         cpuset_t one{};
         CPU_SET(cpu, &one);
-        if (cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1, 8, &one)) break;
+        // One CPU the thread may not move to leaves the others to probe.
+        if (cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1, 8, &one)) {
+            failed |= 1ULL << cpu;
+            continue;
+        }
         changed = true;
+        probed |= 1ULL << cpu;
+        sched_yield();  // read CPUID on that CPU, not before the move
+        if (!cpuid_usable) continue;
         unsigned a, b, c, d;
         __cpuid_count(0xb, 0, a, b, c, d);
         // Architectural SMT level: x2APIC ID above the SMT shift identifies
         // the physical core. Do not assume OS CPU numbering matches APIC IDs.
-        if (!b || ((c >> 8) & 0xff) != 1 || (a & 31) >= 16) break;
-        const unsigned core = d >> (a & 31);
-        cpu_core[cpu] = static_cast<int>(core);
-        if (count == cores.size() ||
-            std::find(cores.begin(), cores.begin() + count, core) != cores.begin() + count) continue;
-        cores[count] = core;
-        worker_cpus[count++] = cpu;
+        // Two CPUs with one x2APIC ID: CPUID does not describe the CPU it runs on.
+        if (!b || ((c >> 8) & 0xff) != 1 || (a & 31) >= 16 ||
+            std::find(apic_id.begin(), apic_id.end(), static_cast<long long>(d)) != apic_id.end()) {
+            cpuid_usable = false;
+            continue;
+        }
+        apic_id[cpu] = d;
+        cpu_core[cpu] = static_cast<int>(d >> (a & 31));
     }
     if (changed) {
         cpuset_t restored{};
@@ -193,32 +232,54 @@ void CheckWorkerTopology() {
             std::memcmp(&original, &restored, 8))
             throw std::runtime_error("Cannot restore topology-probe thread affinity");
     }
-    worker_topology_ready = count == cores.size();
-    topology_allowed = original;
-    topology_allowed_valid = true;
+    // On the console the probe found one core for all CPUs (distinct_cores=1), so no thread was
+    // pinned there. Without a usable CPUID topology, use FreeBSD's numbering: CPU IDs follow APIC
+    // IDs, and Zen 2 gives the two SMT threads of a core consecutive APIC IDs.
+    if (!cpuid_usable)
+        for (unsigned cpu = 0; cpu < 64; ++cpu)
+            cpu_core[cpu] = probed & (1ULL << cpu) ? static_cast<int>(cpu >> 1) : -1;
+    std::array<int, pin_order.size()> cores{};
+    unsigned count = 0;
+    for (unsigned cpu = 0; cpu < 64 && count < cores.size(); ++cpu) {
+        if (cpu_core[cpu] < 0 ||
+            std::find(cores.begin(), cores.begin() + count, cpu_core[cpu]) != cores.begin() + count) continue;
+        cores[count] = cpu_core[cpu];
+        worker_cpus[pin_order[count++]] = static_cast<int>(cpu);
+    }
+    worker_topology_ready = count >= 5;
+    topology_allowed = CpuSet(probed);
+    topology_allowed_valid = probed != 0;
     if (worker_topology_ready) {
         for (unsigned cpu = 0; cpu < 64; ++cpu) {
-            if (!CPU_ISSET(cpu, &original) || cpu_core[cpu] < 0) continue;
-            const bool guest_core = cpu_core[cpu] == static_cast<int>(cores[0]) ||
-                cpu_core[cpu] == static_cast<int>(cores[1]) || cpu_core[cpu] == static_cast<int>(cores[2]);
-            if (!guest_core && cpu != worker_cpus[3] && cpu != worker_cpus[4]) secondary_cpus |= 1ULL << cpu;
+            const int own = static_cast<int>(cpu);
+            if (cpu_core[cpu] < 0 ||
+                std::find(cores.begin(), cores.begin() + 3, cpu_core[cpu]) != cores.begin() + 3 ||
+                own == worker_cpus[3] || own == worker_cpus[4]) continue;
+            secondary_switch1 |= 1ULL << cpu;
+            // Experiment: secondary threads keep the CPUs of guest cores 4 and 5 (pinned there) in
+            // Switch 2 titles too. Reserving them left ~30 threads on CPUs 7, 9 and 11 in MKW.
+            secondary_switch2 |= 1ULL << cpu;
         }
-        std::printf("EDEN_WORKER_SECONDARY mask=%llx\n", secondary_cpus);
+        secondary_cpus.store(secondary_switch1, std::memory_order_relaxed);
+        std::printf("EDEN_WORKER_SECONDARY mask=%llx switch2_mask=%llx\n", secondary_switch1, secondary_switch2);
     }
-    std::printf("EDEN_WORKER_TOPOLOGY ready=%d distinct_cores=%u cpus=%u,%u,%u,%u,%u\n",
-        worker_topology_ready, count, worker_cpus[0], worker_cpus[1], worker_cpus[2], worker_cpus[3], worker_cpus[4]);
+    std::printf("EDEN_WORKER_TOPOLOGY ready=%d distinct_cores=%u source=%s thread_mask=%llx process_mask=%llx "
+                "probed=%llx failed=%llx cpus=%d,%d,%d,%d,%d,%d,%d\n",
+        worker_topology_ready, count, cpuid_usable ? "cpuid" : "pairs", thread_mask, process_mask, probed, failed,
+        worker_cpus[0], worker_cpus[1], worker_cpus[2], worker_cpus[3], worker_cpus[4], worker_cpus[7], worker_cpus[8]);
 }
 void PlaceSecondary(const char* name) {
-    if (!placement_secondary.load(std::memory_order_relaxed) || !secondary_cpus) return;
-    cpuset_t mask{};
-    for (unsigned cpu = 0; cpu < 64; ++cpu)
-        if (secondary_cpus & (1ULL << cpu)) CPU_SET(cpu, &mask);
+    const auto secondary = secondary_cpus.load(std::memory_order_relaxed);
+    if (!placement_secondary.load(std::memory_order_relaxed) || !secondary) return;
+    const cpuset_t mask = CpuSet(secondary);
     const int result = cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1, 8, &mask);
     if (secondary_reports.fetch_add(1, std::memory_order_relaxed) < 64)
-        std::printf("EDEN_WORKER_PLACED name=%s mask=%llx error=%d\n", name, secondary_cpus, result ? errno : 0);
+        std::printf("EDEN_WORKER_PLACED name=%s mask=%llx error=%d\n", name, secondary, result ? errno : 0);
 }
 void PinWorker(unsigned index, cpuset_t& affinity) {
-    if (!worker_topology_ready || index >= worker_cpus.size() ||
+    // Guest cores 4 and 5 of a Switch 1 title stay idle on the CPU set they inherited.
+    if (!worker_topology_ready || worker_cpus[index] < 0 ||
+        (Switch2Core(index) && !switch2_cores.load(std::memory_order_relaxed)) ||
         !CPU_ISSET(worker_cpus[index], topology_allowed_valid ? &topology_allowed : &affinity)) return;
     cpuset_t one{}, verified{};
     CPU_SET(worker_cpus[index], &one);
@@ -233,7 +294,7 @@ void PinWorker(unsigned index, cpuset_t& affinity) {
         return;
     }
     affinity = verified;
-    std::printf("EDEN_WORKER_PIN name=%s cpu=%u verified=1\n", names[index], worker_cpus[index]);
+    std::printf("EDEN_WORKER_PIN name=%s cpu=%d verified=1\n", names[index], worker_cpus[index]);
 }
 #endif
 bool cpu_clocks_valid = false;
@@ -316,19 +377,30 @@ void CheckCpuClocks() {
 void SetSecondaryPlacement(bool enabled) {
 #ifdef PS5_NATIVE
     placement_secondary.store(enabled, std::memory_order_relaxed);
-    if (!secondary_cpus || !topology_allowed_valid) return;
-    cpuset_t mask{};
-    if (enabled) {
-        for (unsigned cpu = 0; cpu < 64; ++cpu)
-            if (secondary_cpus & (1ULL << cpu)) CPU_SET(cpu, &mask);
-    } else {
-        mask = topology_allowed;
-    }
+    const auto secondary = secondary_cpus.load(std::memory_order_relaxed);
+    if (!secondary || !topology_allowed_valid) return;
+    const cpuset_t mask = enabled ? CpuSet(secondary) : topology_allowed;
     const int result = cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1, 8, &mask);
     std::printf("EDEN_WORKER_INHERIT enabled=%d mask=%llx error=%d\n", enabled,
-                enabled ? secondary_cpus : 0ULL, result ? errno : 0);
+                enabled ? secondary : 0ULL, result ? errno : 0);
 #else
     (void)enabled;
+#endif
+}
+
+void ReserveSwitch2Cores(bool switch2) {
+#ifdef PS5_NATIVE
+    switch2_cores.store(switch2, std::memory_order_relaxed);
+    if (!worker_topology_ready) return;
+    const auto secondary = switch2 ? secondary_switch2 : secondary_switch1;
+    secondary_cpus.store(secondary, std::memory_order_relaxed);
+    // Load calls this on the main thread, whose CPU set the threads it creates next inherit.
+    if (!placement_secondary.load(std::memory_order_relaxed) || !secondary) return;
+    const cpuset_t mask = CpuSet(secondary);
+    const int result = cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1, 8, &mask);
+    std::printf("EDEN_WORKER_RESERVE switch2=%d mask=%llx error=%d\n", switch2, secondary, result ? errno : 0);
+#else
+    (void)switch2;
 #endif
 }
 

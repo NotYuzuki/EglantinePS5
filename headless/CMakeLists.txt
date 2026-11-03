@@ -997,6 +997,17 @@ endforeach()
 string(REPLACE "    u64 program_id;\n\n" "" system_source "${system_source}")
 string(REPLACE "        if (app_loader->ReadProgramId(program_id) != Loader::ResultStatus::Success) {\n            LOG_ERROR(Core, \"Failed to find program id for ROM\");\n        }\n\n" "" system_source "${system_source}")
 string(REPLACE "GameSettings::LoadOverrides(program_id," "GameSettings::LoadOverrides(params.program_id," system_source "${system_source}")
+if(PS5_NATIVE)
+    # Guest cores 4 and 5 take CPUs of their own only for Switch 2 titles (headless/performance.cpp).
+    set(old_switch2_flag "        Settings::SetCurrentProgramIsSwitch2(switch2_program);\n")
+    string(FIND "${system_source}" "${old_switch2_flag}" switch2_flag_offset)
+    if(switch2_flag_offset LESS 0)
+        message(FATAL_ERROR "Pinned Switch 2 program detection changed; review guest core placement.")
+    endif()
+    string(REPLACE "${old_switch2_flag}"
+        "${old_switch2_flag}        ::Eden::Performance::ReserveSwitch2Cores(switch2_program);\n" system_source "${system_source}")
+    string(PREPEND system_source "#include \"${EDEN_PORT_DIR}/performance.h\"\n")
+endif()
 # Join callbacks before their service-owned targets can be destroyed.
 set(old_audio_shutdown "        stop_event.request_stop();")
 string(FIND "${system_source}" "${old_audio_shutdown}" audio_shutdown_offset)

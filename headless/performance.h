@@ -13,6 +13,9 @@ namespace Eden::Performance {
 void RegisterWorker(const char* name);
 // Development: keep other named threads off guest cores 0-2 and their SMT siblings.
 void SetSecondaryPlacement(bool enabled);
+// System::Load, before it creates the guest core threads: guest cores 4 and 5 get CPUs of their
+// own (off the secondary set) only for a Switch 2 title.
+void ReserveSwitch2Cores(bool switch2);
 void PlatformChecks();
 // Main thread only, between GPU readiness and guest shutdown.
 void Snapshot();
