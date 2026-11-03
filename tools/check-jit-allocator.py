@@ -30,6 +30,8 @@ static bool enabled;
 static bool reserve_ok;
 static std::uintptr_t reserve_at = 0x1000000000ull;
 extern "C" std::int64_t sceKernelGetDirectMemorySize() { return std::int64_t{1}<<40; }
+// The guest memory service reports the pool from its scanner; nothing is free here.
+extern "C" std::int32_t sceKernelAvailableDirectMemorySize(std::int64_t, std::int64_t, std::size_t, std::int64_t*, std::size_t* largest) { *largest = 0; return 0; }
 extern "C" int sceKernelEnableDmemAliasing() { enabled=true; return 0; }
 // The same source file also holds the heap's growing range and the sparse tables; this check
 // does not use them (tools/check-heap-growth.py and eden-memory-check do).

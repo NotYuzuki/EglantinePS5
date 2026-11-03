@@ -36,6 +36,9 @@ heap = heap[:begin] + (root / 'headless/heap_arenas.inc').read_text() + heap[end
 
 MOCK = r'''
 // A stand-in for the console: mspaces over caller memory, and the range the heap grows in.
+// The app's code range (the linker script names it on the console): the heap measurement reads
+// return addresses inside it only.
+const char __eden_text_start[1], __eden_text_end[1];
 #define _GNU_SOURCE
 #include <assert.h>
 #include <errno.h>
@@ -375,24 +378,26 @@ int main(int argc, char **argv) {
     void *first = __wrap_malloc(100);
     assert(first != NULL);
     if (!refuse_range) {
-        // It starts with one piece, not the whole heap.
-        assert(eden_heap_committed() == piece && atomic_load(&committed_bytes) == piece);
-        assert(__wrap_posix_memalign(&first, 24, 100) == EINVAL && eden_heap_committed() == piece);
+        // It starts with one piece, not the whole heap, and the first thread arena in its own region.
+        const size_t start = piece + (size_t)eden_heap_arenas_created() * EDEN_HEAP_ARENA_SIZE;
+        assert(eden_heap_committed() == start && atomic_load(&committed_bytes) == start);
+        assert(__wrap_posix_memalign(&first, 24, 100) == EINVAL && eden_heap_committed() == start);
     } else {
         assert(eden_heap_committed() == whole && atomic_load(&committed_bytes) == 0);
     }
     pthread_t threads[8];
     for (uintptr_t i = 0; i < 8; ++i) assert(pthread_create(&threads[i], NULL, worker, (void *)(i + 1)) == 0);
     for (int i = 0; i < 8; ++i) pthread_join(threads[i], NULL);
-    // Threads that keep more than an arena's worth of small blocks: arenas of their own take every
-    // one (none goes to the heap's shared spaces), and the next threads, which take their records,
-    // use those arenas again instead of making more.
+    // Threads that keep more than an arena's worth of small blocks: arenas take every one (none
+    // goes to the heap's shared spaces), room in the arenas the workers left first and new ones
+    // only past it, and the next threads, which take their records, use those arenas again
+    // instead of making more.
     static unsigned char *kept[4][KEPT];
     const unsigned long long spills_before = spills_now();
     const unsigned arenas_before = eden_heap_arenas_created();
     keep_and_free(4, kept);
     const unsigned arenas_kept = eden_heap_arenas_created();
-    if (!(arenas_kept > arenas_before && arenas_kept <= arenas_before + 4 * 3 && spills_now() == spills_before)) {
+    if (!(arenas_kept >= arenas_before && arenas_kept <= arenas_before + 4 * 3 && spills_now() == spills_before)) {
         fprintf(stderr, "keepers: arenas %u -> %u, small requests in the shared spaces %llu -> %llu\n",
                 arenas_before, arenas_kept, spills_before, spills_now());
         abort();
@@ -402,6 +407,24 @@ int main(int argc, char **argv) {
         fprintf(stderr, "keepers again: arenas %u -> %u, small requests in the shared spaces %llu -> %llu\n",
                 arenas_kept, eden_heap_arenas_created(), spills_before, spills_now());
         abort();
+    }
+    // Their blocks are all freed: their arenas go back (unreadable here), and the next keepers,
+    // which take their records, make them again over the same memory instead of new ones.
+    if (!refuse_range) {
+        unsigned holding = 0;
+        const size_t given = eden_heap_trim();
+        eden_heap_space_fill(NULL, NULL, NULL, NULL, NULL, NULL, &holding, NULL);
+        if (!(given >= (size_t)(arenas_kept - arenas_before) * EDEN_HEAP_ARENA_SIZE && holding < arenas_kept)) {
+            fprintf(stderr, "keepers' arenas: %zu MiB given back, %u of %u arenas hold memory\n", given >> 20,
+                    holding, arenas_kept);
+            abort();
+        }
+        keep_and_free(4, kept);
+        if (!(eden_heap_arenas_created() == arenas_kept && spills_now() == spills_before)) {
+            fprintf(stderr, "keepers after a trim: arenas %u -> %u, small requests in the shared spaces %llu -> %llu\n",
+                    arenas_kept, eden_heap_arenas_created(), spills_before, spills_now());
+            abort();
+        }
     }
     // Forty at once: more threads than first arenas (32), so the last ones share one at first; each
     // that fills it makes arenas of its own, and still none of its requests goes to the shared spaces.
@@ -531,6 +554,16 @@ int main(int argc, char **argv) {
         }
         for (int i = 0; i < again_count; ++i) { verify(blocks[i], (size_t)24 << 20, (unsigned)i + 5); __wrap_free(blocks[i]); }
         assert(eden_heap_trim() > 0);
+        // The fill the heap report shows follows every block: with all of them freed, the spaces
+        // left hold none.
+        unsigned spaces = 0, arenas_holding = 0;
+        size_t space_bytes = 0, space_used = 1, arena_bytes = 0;
+        eden_heap_space_fill(&spaces, &space_bytes, &space_used, NULL, NULL, NULL, &arenas_holding, &arena_bytes);
+        if (!(spaces >= 1 && space_used == 0 && space_bytes == eden_heap_committed() - arena_bytes &&
+              arenas_holding < eden_heap_arenas_created())) {
+            fprintf(stderr, "fill: %u spaces, %zu MiB, %zu bytes in use\n", spaces, space_bytes >> 20, space_used);
+            abort();
+        }
         printf("given back: %zu MiB of %zu, then %d blocks of 24 MiB again in the same range\n", given >> 20,
                full >> 20, again_count);
     }

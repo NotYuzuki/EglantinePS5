@@ -133,6 +133,18 @@ string(REPLACE "    to.impl->previous_fiber = weak_from.lock();"
     "    to.impl->previous_fiber = weak_from.lock();\n    ASSERT(to.impl->previous_fiber);\n    weak_from.reset();" fiber_source "${fiber_source}")
 string(REPLACE "    // \"from\" might no longer be valid if the thread was killed\n    if (auto from = weak_from.lock()) {"
     "    if (auto* from = static_cast<Fiber*>(transfer.data)) {" fiber_source "${fiber_source}")
+# Each guest thread is a fiber whose stacks the heap backs whole: 2 MiB to run on and 2 MiB never
+# switched to (rewind_stack is only set up), 4 MiB for each of a Switch 2 game's ~170 threads, 690 MiB
+# of the 12 GiB the console shares (Mario Kart World, 2026-11-01). 1 MiB to run on (Eden's OpenOrbis
+# build gives 512 KiB) and 64 KiB for the other.
+string(REPLACE "constexpr size_t DEFAULT_STACK_SIZE = 512 * 4096;"
+    "constexpr size_t DEFAULT_STACK_SIZE = 256 * 4096;\nconstexpr size_t REWIND_STACK_SIZE = 16 * 4096;" fiber_source "${fiber_source}")
+string(REPLACE "    std::array<u8, DEFAULT_STACK_SIZE> rewind_stack{};"
+    "    std::array<u8, REWIND_STACK_SIZE> rewind_stack{};" fiber_source "${fiber_source}")
+string(FIND "${fiber_source}" "REWIND_STACK_SIZE> rewind_stack" fiber_rewind_found)
+if(fiber_rewind_found EQUAL -1)
+    message(FATAL_ERROR "fiber.cpp stack anchors changed")
+endif()
 write_derived("${PORT_BUILD_DIR}/fiber.cpp" "${fiber_source}")
 get_target_property(common_sources common SOURCES)
 list(REMOVE_ITEM common_sources fiber.cpp)
@@ -677,10 +689,13 @@ foreach(bits 32 64)
       # Guest cores 0-2 share a 640 MiB code budget. A64: 256/192/192, since a large
       # open-world game's workers filled 64 MiB on cores 1/2 and evacuated whole caches
       # while streaming. A32 keeps the qualified 512/64/64.
-      # Only the active architecture allocates these caches; core3/host stay 16 MiB.
+      # Only the active architecture allocates these caches. A64 cores 3-5 (Switch 2 titles run
+      # game threads there) get 64 MiB: at 16 MiB, Mario Kart World filled them 75 times in a race
+      # and its cores spent 30-45% of their time compiling the same code again. A cache holds only
+      # the memory its code fills (EDEN_JIT_MEMORY).
       if(PS5_NATIVE)
           if(bits EQUAL 64)
-              set(jit_cache_sizes "m_core_index == 0 ? 256_MiB : m_core_index < 3 ? 192_MiB : 16_MiB")
+              set(jit_cache_sizes "m_core_index == 0 ? 256_MiB : m_core_index < 3 ? 192_MiB : 64_MiB")
           else()
               set(jit_cache_sizes "m_core_index == 0 ? 512_MiB : m_core_index < 3 ? 64_MiB : 16_MiB")
           endif()
