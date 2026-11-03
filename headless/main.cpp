@@ -741,6 +741,9 @@ int main(int argc, char** argv) {
             // Mario Kart World its 64 MiB blocks held 639 MiB unused in 32 of them, none empty enough to
             // give back, while a 48 MiB staging buffer found no block in the pool.
             setenv("EDEN_VMA_BLOCK_MIB", "16", 0);
+            // Indirect indexed draws estimate at most 64 MiB of indices (EDEN_INDEX_ESTIMATE_MIB): a
+            // Switch 2 title's index limit is a whole memory pool (2.4 GB in Donkey Kong Bananza).
+            setenv("EDEN_INDEX_ESTIMATE_MIB", "64", 0);
 #endif
             Common::Log::SetGlobalFilter(filter);
         }
