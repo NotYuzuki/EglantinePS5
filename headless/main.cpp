@@ -737,6 +737,10 @@ int main(int argc, char** argv) {
             // Mario Kart World; it applies to every game. A value set beforehand (a development run) stays.
             setenv("EDEN_NX2_TC_EXPECTED_MIB", "1024", 0);
             setenv("EDEN_NX2_TC_CRITICAL_MIB", "1536", 0);
+            // The device memory allocator's blocks are 16 MiB, not 64 (EDEN_VMA_BLOCK_MIB): in a race of
+            // Mario Kart World its 64 MiB blocks held 639 MiB unused in 32 of them, none empty enough to
+            // give back, while a 48 MiB staging buffer found no block in the pool.
+            setenv("EDEN_VMA_BLOCK_MIB", "16", 0);
 #endif
             Common::Log::SetGlobalFilter(filter);
         }
