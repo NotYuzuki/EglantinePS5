@@ -111,7 +111,9 @@ with tempfile.TemporaryDirectory(prefix='eden-startup-') as directory:
     snapshots = output.split('EDEN_PERF_SAMPLE ')[1:]
     assert len(snapshots) == 5
     for sample in snapshots:
-        assert sample.count('EDEN_PERF_WORKER ') == 9 and sample.count('EDEN_PERF_PROGRESS ') == 4
+        assert sample.count('EDEN_PERF_WORKER ') == 9
+        progress = re.findall(r'EDEN_PERF_PROGRESS .*?core=(\d+) ', sample)
+        assert len(progress) == 6 and set(progress) == {'0', '1', '2', '3', '4', '5'}, progress
         assert 'core=1 compilations=1 ' in sample
         assert re.search(r'name=CPUCore_2 cpu_ns=-\d+', sample)
     assert int(re.search(r'name=CPUCore_1 cpu_ns=(\d+)', snapshots[0])[1]) > 0
