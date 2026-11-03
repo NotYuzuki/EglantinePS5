@@ -47,6 +47,13 @@ namespace {
 // GPU thread's sampler slot (4).
 constexpr std::array names{"CPUCore_0", "CPUCore_1", "CPUCore_2", "CPUCore_3",
                            "GPU", "HostTiming", "VSyncThread", "CPUCore_4", "CPUCore_5"};
+// Worker slots 4-6 belong to GPU/timing threads, not guest cores.
+constexpr unsigned GuestCoreIndex(unsigned worker) {
+    return worker < 4 ? worker : worker == 7 ? 4 : worker == 8 ? 5 : 6;
+}
+static_assert(GuestCoreIndex(0) == 0 && GuestCoreIndex(3) == 3 &&
+              GuestCoreIndex(4) == 6 && GuestCoreIndex(5) == 6 &&
+              GuestCoreIndex(6) == 6 && GuestCoreIndex(7) == 4 && GuestCoreIndex(8) == 5);
 struct Worker {
     pthread_t thread{};
     clockid_t clock{};
@@ -307,9 +314,9 @@ struct CpuSample {
     unsigned svc = ~0u, fpcr = 0;
     unsigned long long compilations = 0, compile_ns = 0;
 };
-std::array<CpuSample, 4> cpu_samples;
+std::array<CpuSample, 6> cpu_samples;
 // Read/written only by the worker owning this core; samples use workers_mutex.
-std::array<unsigned, 4> sampled_epoch{~0u, ~0u, ~0u, ~0u};
+std::array<unsigned, 6> sampled_epoch{~0u, ~0u, ~0u, ~0u, ~0u, ~0u};
 clockid_t process_clock{};
 int CurrentCpuClock(clockid_t* clock, bool process = false) {
 #ifdef PS5_NATIVE
@@ -953,13 +960,15 @@ void RegisterWorker(const char* name) {
         Worker worker;
         worker.thread = pthread_self();
 #ifdef EDEN_DEV_PROFILE
-        if (pc_sampling && (i == 4 || i == pc_sample_core.load())) {
+        const bool sample_core = GuestCoreIndex(i) < cpu_samples.size() &&
+                                 GuestCoreIndex(i) == pc_sample_core.load();
+        if (pc_sampling && (i == 4 || sample_core)) {
             sigset_t mask;
             sigemptyset(&mask);
             sigaddset(&mask, SIGUSR2);
             if (pthread_sigmask(SIG_UNBLOCK, &mask, nullptr))
                 throw std::runtime_error("Cannot enable development PC sampler");
-            if (i == pc_sample_core.load()) {
+            if (sample_core) {
                 core_sample_thread = pthread_self();
                 core_sample_ready.store(true, std::memory_order_release);
                 // dev-settings pc_fast=on: ~500 Hz from 45 s after registration instead of the
@@ -1009,8 +1018,7 @@ void RegisterWorker(const char* name) {
 }
 
 void SampleCpu(unsigned core, unsigned long long thread, unsigned long long pc, unsigned svc, unsigned fpcr) {
-    // Switch 2 titles run six cores: those past the first four are not sampled, as the other
-    // per-core counters skip them (eden_jit_compile, eden_jit_phases).
+    // Only the worker owning this guest core writes its epoch and CPU sample.
     if (core >= sampled_epoch.size()) return;
     const auto epoch = sample_epoch.load(std::memory_order_relaxed);
     if (sampled_epoch[core] == epoch) return;
@@ -1150,39 +1158,40 @@ void Snapshot() {
                     "registered_wall_ns=%lld registered_mono_ns=%lld\n",
                     mono, names[i], cpu, int(worker.clock), worker.affinity_error, worker.allowed, worker.mask,
                     priority_error, policy, priority.sched_priority, worker.wall_ns, worker.mono_ns);
-        if (i < compilation.size()) {
-            const auto& sample = cpu_samples[i];
+        const unsigned core = GuestCoreIndex(i);
+        if (core < compilation.size()) {
+            const auto& sample = cpu_samples[core];
             std::printf("EDEN_PERF_CPU_POINT core=%u phase=%u epoch=%u mono_ns=%lld cpu_ns=%lld thread=%llu pc=%llx svc=%x fpcr=%u compilations=%llu compile_ns=%llu\n",
-                        i, unsigned(cpu_state[i].phase.load(std::memory_order_relaxed)), sample.epoch,
+                        core, unsigned(cpu_state[core].phase.load(std::memory_order_relaxed)), sample.epoch,
                         sample.mono_ns, sample.cpu_ns, sample.thread, sample.pc, sample.svc, sample.fpcr,
                         sample.compilations, sample.compile_ns);
 #ifdef EDEN_DEV_PROFILE
-            const auto& dups = jit_duplicates[i];
+            const auto& dups = jit_duplicates[core];
             std::printf("EDEN_PERF_DUPLICATES mono_ns=%lld core=%u first=%llu again=%llu lead_1ms=%llu lead_10ms=%llu "
-                        "lead_100ms=%llu lead_1s=%llu lead_10s=%llu lead_more=%llu\n", mono, i,
+                        "lead_100ms=%llu lead_1s=%llu lead_10s=%llu lead_more=%llu\n", mono, core,
                         dups[0].load(std::memory_order_relaxed), dups[1].load(std::memory_order_relaxed),
                         dups[2].load(std::memory_order_relaxed), dups[3].load(std::memory_order_relaxed),
                         dups[4].load(std::memory_order_relaxed), dups[5].load(std::memory_order_relaxed),
                         dups[6].load(std::memory_order_relaxed), dups[7].load(std::memory_order_relaxed));
             if (eden_jit_path_counters) {
                 unsigned long long path[8]{};
-                eden_jit_path_counters(i, path);
+                eden_jit_path_counters(core, path);
                 std::printf("EDEN_PERF_JITPATH mono_ns=%lld core=%u runs=%llu thunks=%llu lookups=%llu hits=%llu "
-                            "contended=%llu flush_all=%llu flush_locations=%llu far_links=%llu\n", mono, i,
+                            "contended=%llu flush_all=%llu flush_locations=%llu far_links=%llu\n", mono, core,
                             path[0], path[1], path[2], path[3], path[4], path[5], path[6], path[7]);
             }
             std::printf("EDEN_PERF_PROGRESS mono_ns=%lld core=%u compilations=%llu compile_ns=%llu evacuations=%llu "
                         "translate_ns=%llu optimize_ns=%llu emit_ns=%llu ranges_ns=%llu\n",
-                        mono, i, compilation[i].calls.load(std::memory_order_relaxed),
-                        compilation[i].nanoseconds.load(std::memory_order_relaxed),
-                        evacuations[i].load(std::memory_order_relaxed),
-                        jit_phase_ns[i][0].load(std::memory_order_relaxed), jit_phase_ns[i][1].load(std::memory_order_relaxed),
-                        jit_phase_ns[i][2].load(std::memory_order_relaxed), jit_phase_ns[i][3].load(std::memory_order_relaxed));
+                        mono, core, compilation[core].calls.load(std::memory_order_relaxed),
+                        compilation[core].nanoseconds.load(std::memory_order_relaxed),
+                        evacuations[core].load(std::memory_order_relaxed),
+                        jit_phase_ns[core][0].load(std::memory_order_relaxed), jit_phase_ns[core][1].load(std::memory_order_relaxed),
+                        jit_phase_ns[core][2].load(std::memory_order_relaxed), jit_phase_ns[core][3].load(std::memory_order_relaxed));
 #else
             std::printf("EDEN_PERF_PROGRESS mono_ns=%lld core=%u compilations=%llu compile_ns=%llu evacuations=%llu\n",
-                        mono, i, compilation[i].calls.load(std::memory_order_relaxed),
-                        compilation[i].nanoseconds.load(std::memory_order_relaxed),
-                        evacuations[i].load(std::memory_order_relaxed));
+                        mono, core, compilation[core].calls.load(std::memory_order_relaxed),
+                        compilation[core].nanoseconds.load(std::memory_order_relaxed),
+                        evacuations[core].load(std::memory_order_relaxed));
 #endif
         }
     }

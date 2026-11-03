@@ -26,12 +26,12 @@ void BeginPcSampling();
 void PollGpuPc();
 // Development: A64 block compilation split into translate, optimize, emit and the emitter's
 // block-range registration (part of emit), per guest core, in nanoseconds.
-inline std::array<std::array<std::atomic<unsigned long long>, 4>, 4> jit_phase_ns{};
+inline std::array<std::array<std::atomic<unsigned long long>, 4>, 6> jit_phase_ns{};
 // Development: A64 blocks per guest core that no core had compiled before, that this core had
 // compiled before (after an invalidation), and that another core compiled first, by how long
 // before: under 1 ms, 10 ms, 100 ms, 1 s, 10 s, and later. Counted only with dev-settings
 // jit_dups=on (a process-wide lock and map insert per compiled block).
-inline std::array<std::array<std::atomic<unsigned long long>, 8>, 4> jit_duplicates{};
+inline std::array<std::array<std::atomic<unsigned long long>, 8>, 6> jit_duplicates{};
 inline std::atomic<bool> jit_duplicate_tracking{false};
 // Guest core whose host PCs the development sampler collects (dev-settings pc_core=N, default 0).
 inline std::atomic<unsigned> pc_sample_core{0};
@@ -47,13 +47,13 @@ inline std::atomic<bool> firmware_applets{false};
 // One writer per guest core. JIT state is read only by its owning worker after Run.
 enum class CpuPhase : unsigned { Kernel, Guest, Idle };
 struct alignas(64) CpuState { std::atomic<CpuPhase> phase{}; };
-inline std::array<CpuState, 4> cpu_state{};
+inline std::array<CpuState, 6> cpu_state{};
 void SampleCpu(unsigned core, unsigned long long thread, unsigned long long pc, unsigned svc, unsigned fpcr);
 struct alignas(64) Totals {
     std::atomic<unsigned long long> calls{}, nanoseconds{}, requested_bytes{};
 };
-inline std::array<Totals, 4> compilation;
-inline std::array<std::atomic<unsigned long long>, 4> evacuations{};
+inline std::array<Totals, 6> compilation;
+inline std::array<std::atomic<unsigned long long>, 6> evacuations{};
 inline Totals storage;
 inline Totals jit_protection;
 inline Totals rasterizer_draw;
@@ -361,7 +361,7 @@ inline std::array<std::atomic<unsigned long long>, 20> render_conditions{};
 struct IdleCounters {
     std::atomic<unsigned long long> calls{0}, nanoseconds{0}, sleeps{0};
 };
-inline std::array<IdleCounters, 4> guest_idle{};
+inline std::array<IdleCounters, 6> guest_idle{};
 // PAUSE iterations a guest core spins on its interrupt flag before sleeping (~20 ns each on the
 // console). Guest job systems hand work between cores ~150 times a frame; sleeping on each
 // handoff put the host's thread wake-up latency on the critical path. 100 us (the default) took
@@ -398,7 +398,7 @@ inline void AddSince(Totals& totals, long long start) {
 struct alignas(64) JitCallbacks {
     std::atomic<unsigned long long> reads{}, writes{}, exclusive_writes{};
 };
-inline std::array<JitCallbacks, 4> jit_callbacks{};
+inline std::array<JitCallbacks, 6> jit_callbacks{};
 inline void CountJit(std::atomic<unsigned long long>& counter) {
     counter.fetch_add(1, std::memory_order_relaxed);
 }
