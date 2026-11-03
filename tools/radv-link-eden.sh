@@ -24,6 +24,8 @@ eden_radv_link_recipe() {
     "$(command -v llvm-objcopy-18 || command -v llvm-objcopy)" \
         --redefine-sym __wrap_fclose=ps5_memstream_fclose \
         --redefine-sym __wrap_fflush=ps5_memstream_fflush "$platform_archive"
+    # Rebuild the member index after objcopy rewrites archive member sizes.
+    "$(command -v llvm-ranlib-18 || command -v llvm-ranlib)" "$platform_archive"
     for i in "${!radv_link_inputs[@]}"; do
         [[ ${radv_link_inputs[i]} == "$radv_sdk/target/lib/libps5platform.a" ]] && radv_link_inputs[i]="$platform_archive"
     done

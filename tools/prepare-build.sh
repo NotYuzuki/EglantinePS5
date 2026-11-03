@@ -76,7 +76,9 @@ if [[ -f $radv_release/lib/libvulkan_radeon.ps5.a ]]; then
         rm -f build/radv-isolated/libvulkan_radeon.ps5.a
     fi
 fi
-if [[ ! -f build/radv-isolated/libvulkan_radeon.ps5.a ]]; then
+# Isolated again when the script changes (it also adapts the archive: the queue's clock).
+if [[ ! -f build/radv-isolated/libvulkan_radeon.ps5.a ||
+      tools/isolate-radv.py -nt build/radv-isolated/libvulkan_radeon.ps5.a ]]; then
     if [[ ! -f $radv_release/lib/libvulkan_radeon.ps5.a ]]; then
         step "RADV (Mesa) for the PS5 - this takes a while"
         bash tools/build-radv-dependencies.sh
