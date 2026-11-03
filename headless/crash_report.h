@@ -19,6 +19,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <csignal>
 #include <pthread.h>
 #include <string>
 #include <string_view>
@@ -48,6 +49,20 @@ inline void NameThread(const char* name) noexcept {
     for (; name && name[length] && length + 1 < sizeof(entry->name); ++length) entry->name[length] = name[length];
     entry->name[length] = '\0';
     entry->thread.store(self, std::memory_order_release);
+    // The hang watch asks named threads where they are with SIGUSR1 (crash_report.cpp); a thread
+    // may start with signals blocked.
+    sigset_t sample;
+    sigemptyset(&sample);
+    sigaddset(&sample, SIGUSR1);
+    pthread_sigmask(SIG_UNBLOCK, &sample, nullptr);
+}
+
+// Game frames shown (GraphicsWindow::OnFrameDisplayed). While a game runs, 30 s without one has
+// the hang watch write logs/hang-YYYYMMDD-HHMMSS.txt: every named thread's code addresses on its
+// stack, as a crash report lists the crashed thread's (tools/symbolize-crash.py reads it too).
+inline std::atomic<unsigned long long> frames_displayed{0};
+inline void NoteFrame() noexcept {
+    frames_displayed.fetch_add(1, std::memory_order_relaxed);
 }
 
 // How the launcher is told of a report: its launch error is this, followed by the report's path

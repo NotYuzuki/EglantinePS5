@@ -68,6 +68,7 @@ std::atomic<std::uintptr_t> reporter{0};  // the thread writing the report
 std::atomic<bool> helper_failed{false};   // the system refused both the restart and the exit
 std::atomic<bool> leave{false};           // close the app instead of starting it again
 std::atomic<bool> game_started{false};
+std::atomic<bool> game_running{false};  // the session is a game (the hang watch)
 
 bool installed = false;
 bool restarted_process = false;
@@ -79,6 +80,7 @@ char sessions[2][400];
 std::atomic<unsigned> session_now{0};
 std::atomic<bool> reported{false};  // the report is written: the helper threads act
 int probe_pipe[2] = {-1, -1};       // memory is read through it (Copy)
+int hang_pipe[2] = {-1, -1};        // the hang watch's own (WriteHangReport)
 
 std::uintptr_t CodeStart() noexcept { return reinterpret_cast<std::uintptr_t>(__eden_text_start); }
 std::uintptr_t CodeEnd() noexcept { return reinterpret_cast<std::uintptr_t>(__eden_text_end); }
@@ -196,21 +198,24 @@ Stamp LocalNow() noexcept {
 // Memory that may not be readable is copied by the kernel, which answers a bad address with an
 // error where the handler itself would fault: a write into a pipe, read back. Never more than a
 // page at once, so the pipe always has room.
-bool Copy(const void* address, void* out, std::size_t bytes) noexcept {
-    if (probe_pipe[1] < 0 || bytes == 0 || bytes > 4096) return false;
-    const ssize_t written = write(probe_pipe[1], address, bytes);
+bool CopyWith(const int (&fds)[2], const void* address, void* out, std::size_t bytes) noexcept {
+    if (fds[1] < 0 || bytes == 0 || bytes > 4096) return false;
+    const ssize_t written = write(fds[1], address, bytes);
     std::size_t got = 0;
     char* target = static_cast<char*>(out);
     while (written == static_cast<ssize_t>(bytes) && got < bytes) {
-        const ssize_t count = read(probe_pipe[0], target + got, bytes - got);
+        const ssize_t count = read(fds[0], target + got, bytes - got);
         if (count > 0) got += static_cast<std::size_t>(count);
         else if (count == 0 || errno != EINTR) break;
     }
     if (got == bytes) return true;
     // Whatever a failed write left in the pipe goes (the read end does not block).
     char rest[256];
-    while (read(probe_pipe[0], rest, sizeof(rest)) > 0) {}
+    while (read(fds[0], rest, sizeof(rest)) > 0) {}
     return false;
+}
+bool Copy(const void* address, void* out, std::size_t bytes) noexcept {
+    return CopyWith(probe_pipe, address, out, bytes);
 }
 
 // Whether the eight bytes that end at a code address end with a call instruction: then the
@@ -229,31 +234,35 @@ bool AfterCall(const unsigned char* bytes) noexcept {
 // these are the calls that led to the fault, and now and then one left by an earlier call. The
 // console does not let its code be read, so there every value that points into the code is
 // listed with a "?", and tools/symbolize-crash.py drops those that do not follow a call.
-void PutCalls(std::uint64_t stack) noexcept {
+template <std::size_t N>
+void PutCallsWith(Text<N>& out, const int (&fds)[2], std::uint64_t (&words)[512], std::uint64_t stack,
+                  unsigned most) noexcept {
     constexpr std::size_t kWords = 16 * 1024;  // 128 KiB of stack
-    constexpr unsigned kMost = 64;
     unsigned found = 0;
-    static std::uint64_t words[512];
     std::uint64_t at = stack & ~std::uint64_t{7};
-    for (std::size_t seen = 0; seen < kWords && found < kMost;) {
+    for (std::size_t seen = 0; seen < kWords && found < most;) {
         // Up to the end of the page: a read is whole or not at all.
         const std::size_t bytes = std::min<std::size_t>(4096 - (at & 4095), sizeof(words));
-        if (!Copy(reinterpret_cast<const void*>(at), words, bytes)) break;
-        for (std::size_t i = 0; i < bytes / 8 && found < kMost; ++i) {
+        if (!CopyWith(fds, reinterpret_cast<const void*>(at), words, bytes)) break;
+        for (std::size_t i = 0; i < bytes / 8 && found < most; ++i) {
             const std::uint64_t value = words[i];
             if (!InCode(value) || value < CodeStart() + 8) continue;
             unsigned char before[8];
-            const bool checked = Copy(reinterpret_cast<const void*>(value - 8), before, sizeof(before));
+            const bool checked = CopyWith(fds, reinterpret_cast<const void*>(value - 8), before, sizeof(before));
             if (checked && !AfterCall(before)) continue;
-            report.Put("  ");
-            report.Address(value);
-            report.Put(checked ? "\n" : " ?\n");
+            out.Put("  ");
+            out.Address(value);
+            out.Put(checked ? "\n" : " ?\n");
             ++found;
         }
         at += bytes;
         seen += bytes / 8;
     }
-    if (found == 0) report.Put("  none found\n");
+    if (found == 0) out.Put("  none found\n");
+}
+void PutCalls(std::uint64_t stack) noexcept {
+    static std::uint64_t words[512];
+    PutCallsWith(report, probe_pipe, words, stack, 64);
 }
 
 Registers FromContext(void* context) noexcept {
@@ -529,6 +538,165 @@ void CopyText(char* target, std::size_t size, const char* text) noexcept {
     target[length] = '\0';
 }
 
+// ---- The hang watch: a game that shows no frame for kHangSeconds gets a report of where every
+// named thread is. Each one is asked with SIGUSR1; its handler only stores its instruction and
+// stack pointers, and the watch reads the stacks itself (CopyWith, through its own pipe). It
+// writes with system calls only: a stopped thread may hold the C library's stream locks. A thread
+// that does not answer (signals blocked, or gone) is listed as such. ----
+constexpr unsigned kHangSeconds = 30;
+// Before a game's first frame (loading: Mario Kart World takes ~60 s) the watch waits longer.
+constexpr unsigned kFirstFrameSeconds = 120;
+constexpr unsigned kHangReports = 3;  // per session
+struct Sample {
+    std::atomic<std::uint64_t> rip{0}, rsp{0};
+    std::atomic<bool> answered{false};
+};
+Sample samples[kNamedThreads];
+Text<160 * 1024> hang_report;
+Text<64> hang_name;
+Text<300> hang_path;
+Text<400> hang_note;
+
+void Sampled(int, siginfo_t*, void* context) {
+    const auto self = (std::uintptr_t)pthread_self();
+    for (unsigned i = 0; i < kNamedThreads; ++i) {
+        if (named_threads[i].thread.load(std::memory_order_acquire) != self) continue;
+        const Registers r = FromContext(context);
+        samples[i].rip.store(r.rip, std::memory_order_relaxed);
+        samples[i].rsp.store(r.rsp, std::memory_order_relaxed);
+        samples[i].answered.store(true, std::memory_order_release);
+        return;
+    }
+}
+
+void PutStamp(Text<160 * 1024>& t, const Stamp& stamp) noexcept {
+    t.Dec(static_cast<std::uint64_t>(stamp.year), 4);
+    t.Put('-');
+    t.Dec(stamp.month, 2);
+    t.Put('-');
+    t.Dec(stamp.day, 2);
+    t.Put(' ');
+    t.Dec(stamp.hour, 2);
+    t.Put(':');
+    t.Dec(stamp.minute, 2);
+    t.Put(':');
+    t.Dec(stamp.second, 2);
+}
+
+void WriteHangReport(unsigned seconds, unsigned long long frames) noexcept {
+    const auto self = (std::uintptr_t)pthread_self();
+    unsigned entries = 0, asked = 0, answered = 0;
+    for (unsigned i = 0; i < kNamedThreads; ++i) {
+        samples[i].answered.store(false, std::memory_order_relaxed);
+        const std::uintptr_t thread = named_threads[i].thread.load(std::memory_order_acquire);
+        if (thread == 0 || thread == self) continue;
+        ++entries;
+        if (pthread_kill((pthread_t)thread, SIGUSR1) == 0) ++asked;
+    }
+    for (int wait = 0; wait < 20; ++wait) Sleep(10000);  // 200 ms to answer
+    const Stamp stamp = LocalNow();
+    auto& t = hang_report;
+    t.Clear();
+    t.Put("EglantinePS5 hang report\nversion: ");
+    t.Put(version);
+    t.Put(" (code size 0x");
+    t.Hex(CodeEnd() - CodeStart());
+    t.Put(")\ntime: ");
+    PutStamp(t, stamp);
+    t.Put(", ");
+    t.Dec(static_cast<std::uint64_t>(std::time(nullptr) - started_at));
+    t.Put(" s after the app started\nwhat: no game frame shown for ");
+    t.Dec(seconds);
+    t.Put(" s (");
+    t.Dec(frames);
+    t.Put(" frames shown before)\nrunning: ");
+    t.Put(sessions[session_now.load(std::memory_order_acquire) & 1]);
+    t.Put("\ncode: 0x");
+    t.Hex(CodeStart(), 16);
+    t.Put(" to 0x");
+    t.Hex(CodeEnd(), 16);
+    t.Put(" (eboot+offset is an address in the build's llvm-pie.elf)\n");
+    static std::uint64_t words[512];
+    for (unsigned i = 0; i < kNamedThreads; ++i) {
+        const std::uintptr_t thread = named_threads[i].thread.load(std::memory_order_acquire);
+        if (thread == 0 || thread == self) continue;
+        t.Put("\nthread: ");
+        t.Put(named_threads[i].name);
+        t.Put(" (0x");
+        t.Hex(thread);
+        t.Put(")\n");
+        if (!samples[i].answered.load(std::memory_order_acquire)) {
+            t.Put("  did not answer (signals blocked, or the thread is gone)\n");
+            continue;
+        }
+        ++answered;
+        const std::uint64_t rip = samples[i].rip.load(std::memory_order_relaxed);
+        t.Put("where: ");
+        t.Address(rip);
+        if (!InCode(rip)) t.Put(" (outside the app's code: a system library, often a wait)");
+        t.Put("\ncalls found on the stack, most recent first (\"?\": not checked against a call instruction):\n");
+        PutCallsWith(t, hang_pipe, words, samples[i].rsp.load(std::memory_order_relaxed), 40);
+    }
+    hang_name.Clear();
+    hang_name.Put("hang-");
+    hang_name.Dec(static_cast<std::uint64_t>(stamp.year), 4);
+    hang_name.Dec(stamp.month, 2);
+    hang_name.Dec(stamp.day, 2);
+    hang_name.Put('-');
+    hang_name.Dec(stamp.hour, 2);
+    hang_name.Dec(stamp.minute, 2);
+    hang_name.Dec(stamp.second, 2);
+    hang_name.Put(".txt");
+    hang_path.Clear();
+    hang_path.Put(logs);
+    hang_path.Put('/');
+    hang_path.Put(hang_name.data);
+    const bool saved = WriteFile(hang_path.data, t.data, t.size);
+    hang_note.Clear();
+    hang_note.Put("EDEN_HANG seconds=");
+    hang_note.Dec(seconds);
+    hang_note.Put(" threads=");
+    hang_note.Dec(entries);
+    hang_note.Put(" asked=");
+    hang_note.Dec(asked);
+    hang_note.Put(" answered=");
+    hang_note.Dec(answered);
+    hang_note.Put(saved ? " report=" : " report_not_written=");
+    hang_note.Put(hang_path.data);
+    hang_note.Put('\n');
+    Note(hang_note.data);
+    (void)!write(2, hang_note.data, hang_note.size);  // stderr.log, past any stream lock
+}
+
+void HangWatch() {
+    unsigned long long last = frames_displayed.load(std::memory_order_relaxed);
+    unsigned still = 0, reports = 0;
+    bool reported_this_stop = false, was_running = false;
+    for (;;) {
+        Sleep(1000000);
+        const bool running = game_running.load(std::memory_order_acquire);
+        if (running && !was_running) {
+            reports = 0;  // a new game session
+            still = 0;
+        }
+        was_running = running;
+        const unsigned long long frames = frames_displayed.load(std::memory_order_relaxed);
+        if (!running || frames != last) {
+            last = frames;
+            still = 0;
+            reported_this_stop = false;
+            continue;
+        }
+        if (++still < (frames == 0 ? kFirstFrameSeconds : kHangSeconds) || reported_this_stop ||
+            reports >= kHangReports ||
+            state.load(std::memory_order_acquire) != kIdle)
+            continue;
+        WriteHangReport(still, frames);
+        reported_this_stop = true;
+        ++reports;
+    }
+}
+
 } // namespace
 
 bool Readable(const void* address, std::size_t bytes) noexcept {
@@ -559,8 +727,21 @@ void Install(const std::string& logs_folder, const char* app_version, bool resta
         probe = Readable(&started_at, sizeof(started_at));
     }
     if (!probe) probe_pipe[0] = probe_pipe[1] = -1;
+    if (pipe(hang_pipe) == 0) {
+        fcntl(hang_pipe[0], F_SETFL, O_NONBLOCK);
+        fcntl(hang_pipe[1], F_SETFL, O_NONBLOCK);
+    } else {
+        hang_pipe[0] = hang_pipe[1] = -1;
+    }
     std::thread(Restarter).detach();
     std::thread(Flusher).detach();
+    {
+        struct sigaction sample {};
+        sample.sa_sigaction = Sampled;
+        sample.sa_flags = SA_SIGINFO | SA_RESTART;
+        sigemptyset(&sample.sa_mask);
+        if (sigaction(SIGUSR1, &sample, nullptr) == 0) std::thread(HangWatch).detach();
+    }
     struct sigaction action {};
     action.sa_sigaction = Handle;
     action.sa_flags = SA_SIGINFO;
@@ -577,6 +758,7 @@ void SetSession(const std::string& text, bool game) noexcept {
     CopyText(sessions[next], sizeof(sessions[next]), text.c_str());
     session_now.store(next, std::memory_order_release);
     if (game) game_started.store(true, std::memory_order_relaxed);
+    game_running.store(game, std::memory_order_release);
 }
 
 void Fail(const char* reason) noexcept {
