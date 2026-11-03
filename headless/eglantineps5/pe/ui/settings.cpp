@@ -82,6 +82,7 @@ enum PerformanceRow : int
     speed_unsafe_dma,
     speed_reactive_flushing,
     speed_skip_invalidation,
+    speed_fps_30,
     kPerformanceRows,
 };
 constexpr int kPerformanceRowsShown = 4;
@@ -224,7 +225,7 @@ void Launcher::draw_settings(Canvas &c)
         playing_,
         prefs_.renderer != 0 ? "Vulkan" : "OpenGL",
         prefs_.async_shaders || prefs_.fast_gpu || prefs_.unsafe_cpu || prefs_.unsafe_dma ||
-                !prefs_.reactive_flushing || prefs_.skip_invalidation ? tr("On") : "",
+                !prefs_.reactive_flushing || prefs_.skip_invalidation || prefs_.fps_30 ? tr("On") : "",
         prefs_.mute ? tr("Muted") : percent(prefs_.volume),
         prefs_.vibration ? tr("Vibration on") : tr("Vibration off"),
         prefs_.large_text || prefs_.high_contrast || prefs_.reduce_motion ? tr("On") : "",
@@ -305,7 +306,8 @@ void Launcher::draw_settings(Canvas &c)
                  {tr("FASTER CPU EMULATION"), on_off(prefs_.unsafe_cpu)},
                  {tr("FASTER DMA"), on_off(prefs_.unsafe_dma)},
                  {tr("REACTIVE FLUSHING"), on_off(prefs_.reactive_flushing)},
-                 {tr("SKIP CPU INVALIDATION"), on_off(prefs_.skip_invalidation)}};
+                 {tr("SKIP CPU INVALIDATION"), on_off(prefs_.skip_invalidation)},
+                 {tr("30 FPS LIMIT"), on_off(prefs_.fps_30)}};
         break;
     case kAudio:
         about = tr("Game volume, and the sounds of this menu.");
@@ -582,7 +584,7 @@ void Launcher::press_dialog(Key key)
     {
         bool *const switches[kPerformanceRows] = {
             &prefs_.block_list, &prefs_.async_shaders,     &prefs_.fast_gpu, &prefs_.unsafe_cpu,
-            &prefs_.unsafe_dma, &prefs_.reactive_flushing, &prefs_.skip_invalidation};
+            &prefs_.unsafe_dma, &prefs_.reactive_flushing, &prefs_.skip_invalidation, &prefs_.fps_30};
         bool &value = *switches[std::clamp(option_, 0, kPerformanceRows - 1)];
         value = !value;
         break;
@@ -815,7 +817,7 @@ void Launcher::draw_dialog(Canvas &c, Modal modal, float open)
         static constexpr const char *kNames[kPerformanceRows] = {
             TR("Compile ahead"),        TR("Asynchronous shaders"), TR("Faster GPU emulation"),
             TR("Faster CPU emulation"), TR("Faster DMA"),           TR("Reactive flushing"),
-            TR("Skip CPU invalidation")};
+            TR("Skip CPU invalidation"), TR("30 FPS limit")};
         for (int row = first; row <= last; ++row)
         {
             list.push_opacity(rows_view.row_alpha(row, kVideoRowHeight));

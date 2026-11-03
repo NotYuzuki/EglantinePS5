@@ -113,6 +113,7 @@ extern "C" bool eden_jit_shared;  // headless/dynarmic/jit_group_support.inc
 #endif
 #include "profiles.h"
 #include "stop_limit.h"
+namespace Common { void SetGuestMemoryFine(bool on) noexcept; }
 namespace Common {
 bool SparseTablesAvailable() noexcept; // src/memory_pages.cpp
 }
@@ -711,7 +712,38 @@ int main(int argc, char** argv) {
             Common::Log::Filter filter;
             filter.SetClassLevel(Common::Log::Class::Service_FS, Common::Log::Level::Info);
 #if defined(PS5_NATIVE) && !defined(EDEN_DEV_PROFILE) && !defined(EDEN_DEV_ROM_ID)
-            if (Eden::LoadPreferences().detailed_logging) filter.ParseFilterString("*:Debug");
+            if (Eden::LoadPreferences().detailed_logging) {
+                filter.ParseFilterString("*:Debug");
+                // Every native (Switch 2) program the session captures, kept once by its key in
+                // logs/native-shaders (EDEN_NX2_SHADER_DUMP, read when the first one is lowered),
+                // so a program the lowering rejects can be studied off the console.
+                const std::string shaders = Eden::LogsDir() + "/native-shaders";
+                setenv("EDEN_NX2_SHADER_DUMP", shaders.c_str(), 1);
+            }
+#endif
+#ifdef PS5_NATIVE
+            // The settings below hold in development builds too, so that what they measure is what
+            // the release build does (dev-settings env=... still replaces any of them).
+            // Compact memory (src/guest_memory_service.inc, SetGuestMemoryFine): written slots
+            // with many pages of zeroes keep only the others. A Switch 2 game filled the pool with
+            // the guest's 5.3 GiB; each such slot written again costs a fault and a 2 MiB copy.
+            Common::SetGuestMemoryFine(true);
+            // The texture cache collects from 1 GiB and hard from 1.5 GiB of device memory: the
+            // driver reports the whole 12 GiB pool as its budget, so following it collected too late.
+            // At 2/2.5 GiB a Switch 2 game took 4.2 GiB, the heap 2.7 GiB and the guest reserve 1 GiB,
+            // and with graphics at 4.6 GiB the pool ran out (Mario Kart World, 2026-11-01). Each 512 MiB
+            // step down followed a run that ran out: at every race start graphics took its 3 GiB, the
+            // guest 5.7 GiB and the heap 2.2 GiB, and an image found no memory (2026-11-03). Tuned on
+            // Mario Kart World; it applies to every game. A value set beforehand (a development run) stays.
+            setenv("EDEN_NX2_TC_EXPECTED_MIB", "1024", 0);
+            setenv("EDEN_NX2_TC_CRITICAL_MIB", "1536", 0);
+            // The device memory allocator's blocks are 16 MiB, not 64 (EDEN_VMA_BLOCK_MIB): in a race of
+            // Mario Kart World its 64 MiB blocks held 639 MiB unused in 32 of them, none empty enough to
+            // give back, while a 48 MiB staging buffer found no block in the pool.
+            setenv("EDEN_VMA_BLOCK_MIB", "16", 0);
+            // Indirect indexed draws estimate at most 64 MiB of indices (EDEN_INDEX_ESTIMATE_MIB): a
+            // Switch 2 title's index limit is a whole memory pool (2.4 GB in Donkey Kong Bananza).
+            setenv("EDEN_INDEX_ESTIMATE_MIB", "64", 0);
 #endif
             Common::Log::SetGlobalFilter(filter);
         }
@@ -1044,6 +1076,18 @@ int main(int argc, char** argv) {
             if (speed.unsafe_dma) Settings::values.dma_accuracy.SetValue(Settings::DmaAccuracy::Unsafe);
             Settings::values.use_reactive_flushing.SetValue(speed.reactive_flushing);
             Settings::values.skip_cpu_inner_invalidation.SetValue(speed.skip_invalidation);
+            // 30 FPS limit: presents held to 30 a second (eglantine patch 0039). A rate set beforehand
+            // (dev-settings env=EDEN_NX2_PRESENT_HZ=...) stays when the switch is off.
+            {
+                static bool limit_set = false;
+                if (speed.fps_30) {
+                    setenv("EDEN_NX2_PRESENT_HZ", "30", 1);
+                    limit_set = true;
+                } else if (limit_set) {
+                    unsetenv("EDEN_NX2_PRESENT_HZ");
+                    limit_set = false;
+                }
+            }
             // The block list is off unless the settings turn it on (block-list.txt in the app
             // folder still does, further down).
             if (!dev_block_list) Eden::JitList::enabled = speed.block_list;
@@ -1058,7 +1102,8 @@ int main(int argc, char** argv) {
                                     on(Settings::values.dma_accuracy.GetValue() == Settings::DmaAccuracy::Unsafe) +
                                     ", reactive flushing " + on(Settings::values.use_reactive_flushing.GetValue()) +
                                     ", skip invalidation " +
-                                    on(Settings::values.skip_cpu_inner_invalidation.GetValue())).c_str());
+                                    on(Settings::values.skip_cpu_inner_invalidation.GetValue()) +
+                                    ", 30 fps limit " + on(speed.fps_30)).c_str());
             // What a crash report says was running.
             char title_id[20];
             std::snprintf(title_id, sizeof(title_id), "%016llx",

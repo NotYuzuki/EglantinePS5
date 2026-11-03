@@ -27,6 +27,14 @@ msgstr ""
 msgid "2x (sharpest)"
 msgstr ""
 
+#: pe/ui/game_options.cpp, pe/ui/settings.cpp
+msgid "30 FPS limit"
+msgstr ""
+
+#: pe/ui/settings.cpp
+msgid "30 FPS LIMIT"
+msgstr ""
+
 #: settings_store.h
 msgid "3x (slower)"
 msgstr ""

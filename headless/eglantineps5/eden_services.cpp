@@ -1350,6 +1350,7 @@ pe::ui::Preferences EdenServices::preferences() {
     result.unsafe_dma = speed.unsafe_dma;
     result.reactive_flushing = speed.reactive_flushing;
     result.skip_invalidation = speed.skip_invalidation;
+    result.fps_30 = speed.fps_30;
     result.mapping = saved.mapping;
     return result;
 }
@@ -1385,6 +1386,7 @@ bool EdenServices::set_preferences(const pe::ui::Preferences& preferences) {
     speed.unsafe_dma = preferences.unsafe_dma;
     speed.reactive_flushing = preferences.reactive_flushing;
     speed.skip_invalidation = preferences.skip_invalidation;
+    speed.fps_30 = preferences.fps_30;
     const bool saved = Eden::SavePreferences(value) && Eden::SavePerformance(0, speed);
     if (!saved) Eden::Report("settings", "Could not write preferences");
     if (saved) Eden::Multiplayer::SetDetailedLogging(value.detailed_logging);
