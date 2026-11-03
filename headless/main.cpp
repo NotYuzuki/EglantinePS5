@@ -728,6 +728,15 @@ int main(int argc, char** argv) {
             // with many pages of zeroes keep only the others. A Switch 2 game filled the pool with
             // the guest's 5.3 GiB; each such slot written again costs a fault and a 2 MiB copy.
             Common::SetGuestMemoryFine(true);
+            // The texture cache collects from 1 GiB and hard from 1.5 GiB of device memory: the
+            // driver reports the whole 12 GiB pool as its budget, so following it collected too late.
+            // At 2/2.5 GiB a Switch 2 game took 4.2 GiB, the heap 2.7 GiB and the guest reserve 1 GiB,
+            // and with graphics at 4.6 GiB the pool ran out (Mario Kart World, 2026-11-01). Each 512 MiB
+            // step down followed a run that ran out: at every race start graphics took its 3 GiB, the
+            // guest 5.7 GiB and the heap 2.2 GiB, and an image found no memory (2026-11-03). Tuned on
+            // Mario Kart World; it applies to every game. A value set beforehand (a development run) stays.
+            setenv("EDEN_NX2_TC_EXPECTED_MIB", "1024", 0);
+            setenv("EDEN_NX2_TC_CRITICAL_MIB", "1536", 0);
 #endif
             Common::Log::SetGlobalFilter(filter);
         }
