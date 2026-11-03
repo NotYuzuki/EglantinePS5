@@ -113,6 +113,7 @@ extern "C" bool eden_jit_shared;  // headless/dynarmic/jit_group_support.inc
 #endif
 #include "profiles.h"
 #include "stop_limit.h"
+namespace Common { void SetGuestMemoryFine(bool on) noexcept; }
 namespace Common {
 bool SparseTablesAvailable() noexcept; // src/memory_pages.cpp
 }
@@ -712,6 +713,14 @@ int main(int argc, char** argv) {
             filter.SetClassLevel(Common::Log::Class::Service_FS, Common::Log::Level::Info);
 #if defined(PS5_NATIVE) && !defined(EDEN_DEV_PROFILE) && !defined(EDEN_DEV_ROM_ID)
             if (Eden::LoadPreferences().detailed_logging) filter.ParseFilterString("*:Debug");
+#endif
+#ifdef PS5_NATIVE
+            // The settings below hold in development builds too, so that what they measure is what
+            // the release build does (dev-settings env=... still replaces any of them).
+            // Compact memory (src/guest_memory_service.inc, SetGuestMemoryFine): written slots
+            // with many pages of zeroes keep only the others. A Switch 2 game filled the pool with
+            // the guest's 5.3 GiB; each such slot written again costs a fault and a 2 MiB copy.
+            Common::SetGuestMemoryFine(true);
 #endif
             Common::Log::SetGlobalFilter(filter);
         }
