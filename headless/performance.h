@@ -404,6 +404,12 @@ inline void CountJit(std::atomic<unsigned long long>& counter) {
 void ReportGpuThread(unsigned frame);
 // The heap's line in stderr.log: what it holds of the pool, what of that its blocks use, what it has given back.
 void ReportHeap(const char* why);
+// The app's memory mappings in stderr.log (EDEN_MAPPINGS): how many, how much, how many and how much
+// the GPU can reach, and the largest of those. With probe (a graphics allocation was just refused),
+// also whether a 64 KiB and a 64 MiB GPU mapping can still be made, as the Vulkan driver makes them.
+void ReportMappings(const char* why, bool probe);
+// Writes `text` to logs/<name> (a measurement too large for stderr.log), replacing it.
+void WriteLogFile(const char* name, const char* text);
 // Gives the heap's empty spaces back to the pool; the bytes returned.
 std::size_t TrimHeap(const char* why);
 inline std::atomic<unsigned> capture_passes{};

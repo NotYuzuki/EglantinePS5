@@ -2,6 +2,7 @@
 #include "performance.h"
 #include "crash_report.h"
 #include "stall_watchdog.h"
+#include "storage_paths.h"
 #include "../src/fastmem.h"
 #include "common/cpu_features.h"
 #include "common/sparse_large_vector.h"
@@ -344,6 +345,9 @@ extern "C" std::size_t eden_heap_large_held(unsigned* blocks) __attribute__((wea
 extern "C" std::size_t eden_heap_trim(void) __attribute__((weak));
 extern "C" void eden_heap_sites_report(void) __attribute__((weak));
 extern "C" void eden_heap_usage(std::size_t* held, std::size_t* in_use, std::size_t* returned) __attribute__((weak));
+extern "C" void eden_heap_space_fill(unsigned* spaces, std::size_t* space_bytes, std::size_t* space_used,
+                                     unsigned* sparse, std::size_t* sparse_bytes, std::size_t* sparse_used,
+                                     unsigned* arenas, std::size_t* arena_bytes) __attribute__((weak));
 extern "C" unsigned eden_guest_memory_wanted(void) __attribute__((weak));
 extern "C" void eden_guest_memory_reserve(std::size_t* held, std::size_t* target) __attribute__((weak));
 #ifdef PS5_NATIVE
@@ -353,6 +357,23 @@ extern "C" std::int32_t sceKernelAvailableDirectMemorySize(std::int64_t, std::in
 // The allocated region at or after an offset (flag 1: find the next one).
 struct DirectMemoryRegion { std::int64_t start; std::int64_t end; std::int32_t type; };
 extern "C" std::int32_t sceKernelDirectMemoryQuery(std::int64_t, int, DirectMemoryRegion*, std::size_t);
+// One mapping of the process at or after an address (flag 1: find the next one). The layout of
+// SceKernelVirtualQueryInfo (PS4 and PS5).
+struct VirtualQueryInfo {
+    std::uintptr_t start;
+    std::uintptr_t end;
+    std::int64_t offset;
+    std::int32_t protection;
+    std::int32_t memory_type;
+    std::uint32_t flags;  // flexible 1, direct 2, stack 4, pooled 8, committed 16
+    char name[32];
+};
+extern "C" std::int32_t sceKernelVirtualQuery(const void*, int, VirtualQueryInfo*, std::size_t);
+extern "C" std::int32_t sceKernelAllocateDirectMemory(std::int64_t, std::int64_t, std::size_t, std::size_t, int,
+                                                      std::int64_t*);
+extern "C" std::int32_t sceKernelMapDirectMemory(void**, std::size_t, int, int, std::int64_t, std::size_t);
+extern "C" std::int32_t sceKernelReleaseDirectMemory(std::int64_t, std::size_t);
+extern "C" int sceKernelMunmap(void*, std::size_t);
 #endif
 
 #ifdef PS5_NATIVE
@@ -383,6 +404,7 @@ static void RefreshFreeMemory() {
         std::fprintf(stderr, "EDEN_MEMORY pool largest free block %zu MiB, short=%d; the guest's memory holds %zu MiB\n",
                      largest >> 20, int(view.short_memory), guest_held >> 20);
         ReportHeap("every 20 s");
+        ReportMappings("every 20 s", false);
     }
     // The heap's empty spaces go back to the pool while it is short (every 2 s at most).
     static std::atomic<long long> trimmed_ns{0};
@@ -426,6 +448,149 @@ void RecordHle(const char* service, unsigned command, long long ns) {
     entry.second += static_cast<unsigned long long>(ns > 0 ? ns : 0);
 }
 
+#ifdef PS5_NATIVE
+namespace {
+// A mapping as the Vulkan driver makes one (radv_ps5_memory_alloc: type 12, CPU and GPU read and
+// write, protection 0x33), or the CPU's only (0x03): the allocation's result and the mapping's (not
+// tried when the allocation failed).
+struct Probe {
+    std::int32_t allocated = 0, mapped = -1;
+};
+Probe ProbeMapping(std::size_t bytes, std::size_t alignment, int protection) {
+    Probe probe;
+    std::int64_t physical = -1;
+    probe.allocated =
+        sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), bytes, alignment, 12, &physical);
+    if (probe.allocated != 0) return probe;
+    void* address = nullptr;
+    probe.mapped = sceKernelMapDirectMemory(&address, bytes, protection, 0, physical, alignment);
+    if (probe.mapped == 0 && address != nullptr) sceKernelMunmap(address, bytes);
+    sceKernelReleaseDirectMemory(physical, bytes);
+    return probe;
+}
+// The mappings of one owner: the kernel's name for them, their memory type and protection;
+// how many and how much, and how many fall in each size class (to 64 KiB, 2 MiB, 64 MiB, larger).
+struct MappingOwner {
+    char name[32];
+    std::int32_t memory_type;
+    std::int32_t protection;
+    unsigned long long entries, bytes;
+    unsigned sizes[4];
+};
+} // namespace
+#endif
+
+void ReportMappings(const char* why, bool probe) {
+#ifdef PS5_NATIVE
+    static std::atomic<unsigned> probes{0};
+    if (probe && probes.fetch_add(1, std::memory_order_relaxed) >= 4) return;
+    unsigned long long entries = 0, bytes = 0, gpu_entries = 0, gpu_bytes = 0, direct_entries = 0,
+                       direct_bytes = 0, largest_gpu = 0;
+    // A fixed table, so a report made while memory is short asks for none; the owners past it are
+    // counted in the last row.
+    static constexpr std::size_t MaxOwners = 48;
+    static MappingOwner owners[MaxOwners];
+    static std::mutex owners_lock;
+    std::scoped_lock owners_guard{owners_lock};
+    std::size_t owner_count = 0;
+    unsigned long long gpu_sizes[4]{}, gpu_size_bytes[4]{};
+    std::int32_t last = 0;
+    std::uintptr_t at = 0;
+    for (unsigned guard = 0; guard < 1000000; ++guard) {
+        VirtualQueryInfo info{};
+        last = sceKernelVirtualQuery(reinterpret_cast<const void*>(at), 1, &info, sizeof(info));
+        if (last != 0 || info.end <= at) break;
+        const unsigned long long size = info.end - info.start;
+        ++entries;
+        bytes += size;
+        if (info.protection & 0x30) {
+            ++gpu_entries;
+            gpu_bytes += size;
+            largest_gpu = std::max(largest_gpu, size);
+            const unsigned size_class = size <= (64ull << 10) ? 0 : size <= (2ull << 20) ? 1 : size <= (64ull << 20) ? 2 : 3;
+            ++gpu_sizes[size_class];
+            gpu_size_bytes[size_class] += size;
+        }
+        {
+            const unsigned size_class = size <= (64ull << 10) ? 0 : size <= (2ull << 20) ? 1 : size <= (64ull << 20) ? 2 : 3;
+            info.name[sizeof(info.name) - 1] = '\0';
+            std::size_t o = 0;
+            while (o < owner_count && (owners[o].memory_type != info.memory_type ||
+                                       owners[o].protection != info.protection ||
+                                       std::strcmp(owners[o].name, info.name) != 0))
+                ++o;
+            if (o == owner_count) {
+                if (owner_count < MaxOwners) {
+                    ++owner_count;
+                    owners[o] = MappingOwner{};
+                    std::memcpy(owners[o].name, info.name, sizeof(owners[o].name));
+                    owners[o].memory_type = info.memory_type;
+                    owners[o].protection = info.protection;
+                } else {
+                    o = MaxOwners - 1;
+                    std::strcpy(owners[o].name, "(others)");
+                }
+            }
+            ++owners[o].entries;
+            owners[o].bytes += size;
+            ++owners[o].sizes[size_class];
+        }
+        if (info.flags & 2) {
+            ++direct_entries;
+            direct_bytes += size;
+        }
+        at = info.end;
+    }
+    // Whether the CPU's own mapping of the same size is refused too: then the limit is the process's
+    // mappings, not the GPU's.
+    Probe small, large, cpu;
+    if (probe) {
+        small = ProbeMapping(std::size_t{64} << 10, std::size_t{64} << 10, 0x33);
+        large = ProbeMapping(std::size_t{64} << 20, std::size_t{2} << 20, 0x33);
+        cpu = ProbeMapping(std::size_t{64} << 20, std::size_t{2} << 20, 0x03);
+    }
+    std::fprintf(stderr,
+                 "EDEN_MAPPINGS %s: %llu mappings (%llu MiB), %llu GPU-visible (%llu MiB, largest %llu MiB), "
+                 "%llu direct (%llu MiB); query ended %#x",
+                 why, entries, bytes >> 20, gpu_entries, gpu_bytes >> 20, largest_gpu >> 20, direct_entries,
+                 direct_bytes >> 20, static_cast<unsigned>(last));
+    if (probe)
+        std::fprintf(stderr,
+                     "; a new GPU mapping (allocation/mapping) of 64 KiB: %#x/%#x, of 64 MiB: %#x/%#x; "
+                     "a CPU-only one of 64 MiB: %#x/%#x",
+                     static_cast<unsigned>(small.allocated), static_cast<unsigned>(small.mapped),
+                     static_cast<unsigned>(large.allocated), static_cast<unsigned>(large.mapped),
+                     static_cast<unsigned>(cpu.allocated), static_cast<unsigned>(cpu.mapped));
+    std::fputc('\n', stderr);
+    std::fprintf(stderr,
+                 "EDEN_MAPPINGS_GPU sizes: to 64 KiB %llu (%llu MiB), to 2 MiB %llu (%llu MiB), to 64 MiB %llu "
+                 "(%llu MiB), larger %llu (%llu MiB)\n",
+                 gpu_sizes[0], gpu_size_bytes[0] >> 20, gpu_sizes[1], gpu_size_bytes[1] >> 20, gpu_sizes[2],
+                 gpu_size_bytes[2] >> 20, gpu_sizes[3], gpu_size_bytes[3] >> 20);
+    // The twelve largest owners of all the mappings.
+    std::sort(owners, owners + owner_count,
+              [](const MappingOwner& a, const MappingOwner& b) { return a.bytes > b.bytes; });
+    for (std::size_t o = 0; o < std::min<std::size_t>(owner_count, 12); ++o)
+        std::fprintf(stderr,
+                     "EDEN_MAPPINGS owner \"%s\" type %d prot %#x: %llu mappings, %llu MiB (sizes %u/%u/%u/%u)\n",
+                     owners[o].name, owners[o].memory_type, static_cast<unsigned>(owners[o].protection),
+                     owners[o].entries, owners[o].bytes >> 20, owners[o].sizes[0], owners[o].sizes[1],
+                     owners[o].sizes[2], owners[o].sizes[3]);
+#else
+    (void)why;
+    (void)probe;
+#endif
+}
+
+void WriteLogFile(const char* name, const char* text) {
+    const std::string path = Eden::LogFile(name);
+    if (std::FILE* file = std::fopen(path.c_str(), "wb")) {
+        std::fputs(text, file);
+        std::fclose(file);
+        std::fprintf(stderr, "EDEN_LOG_FILE %s written (%zu bytes)\n", path.c_str(), std::strlen(text));
+    }
+}
+
 void ReportHeap(const char* why) {
     if (!eden_heap_usage) return;
     std::size_t held = 0, in_use = 0, returned = 0;
@@ -435,6 +600,20 @@ void ReportHeap(const char* why) {
     std::fprintf(stderr, "[EglantinePS5] heap: holds %zu MiB (%zu MiB of pieces, %zu MiB in %u large blocks), "
                          "%zu MiB of it in use; %zu MiB given back so far (%s)\n",
                  held >> 20, (held - large) >> 20, large >> 20, large_blocks, in_use >> 20, returned >> 20, why);
+    // Where the pieces' memory is: only a space with no block left goes back, so free room in the
+    // spaces that keep a block, and the arenas (each stays), are what a trim cannot give back.
+    if (eden_heap_space_fill) {
+        unsigned spaces = 0, sparse = 0, arenas = 0;
+        std::size_t space_bytes = 0, space_used = 0, sparse_bytes = 0, sparse_used = 0, arena_bytes = 0;
+        eden_heap_space_fill(&spaces, &space_bytes, &space_used, &sparse, &sparse_bytes, &sparse_used, &arenas,
+                             &arena_bytes);
+        const std::size_t outside = space_used + large;
+        std::fprintf(stderr, "[EglantinePS5] heap pieces: %u spaces hold %zu MiB, %zu MiB of it in use (%u under a "
+                             "quarter full hold %zu MiB, %zu MiB in use); %u arenas hold %zu MiB, ~%zu MiB in use "
+                             "with the threads' caches\n",
+                     spaces, space_bytes >> 20, space_used >> 20, sparse, sparse_bytes >> 20, sparse_used >> 20,
+                     arenas, arena_bytes >> 20, (in_use > outside ? in_use - outside : 0) >> 20);
+    }
     if (eden_heap_sites_report) eden_heap_sites_report();
 }
 
