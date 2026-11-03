@@ -13,6 +13,12 @@
 //           others a compact block that holds only them (a written slot with many pages of zeroes);
 //           a write makes it whole again, and it waits longer each time before it may be Fine again
 //
+// On the console a Zero slot is only reserved until it is touched: the first access faults and the
+// slot shows the zero block from then on (a write then faults again, as below). The console maps at
+// most about 32 GiB of direct memory for a process, and the zero block over every slot of a Switch 2
+// game's 20 GiB took 19 GiB of it: graphics and the CPU's own mappings were refused at the rest
+// (Mario Kart World, 2026-11-01). A slot that goes back is only reserved again.
+//
 // A write to a Zero or Shared slot faults; HandleGuestWriteFault gives the slot a block of its
 // own (zeroed, or a copy) and the write repeats. So memory is no longer taken when the guest's
 // kernel hands pages out, only when they are written; a slot the guest's kernel clears or frees
@@ -44,13 +50,14 @@ struct Counters {
     std::atomic<std::uint64_t> returns_clear{0}, returns_free{0}, returns_scan{0}, dedup{0};
     std::atomic<std::uint64_t> reserve_used{0}, failures{0}, passes{0}, scan_ns{0};
     std::atomic<std::uint64_t> fined{0}, unfined{0}, fine_failures{0};
+    std::atomic<std::uint64_t> shows{0}; // Zero slots that came to show the zero block (a first access)
 };
 Counters counters;
 void ResetCounters() noexcept {
     for (auto* counter : {&counters.faults, &counters.promotions, &counters.copies, &counters.waits,
                           &counters.returns_clear, &counters.returns_free, &counters.returns_scan, &counters.dedup,
                           &counters.reserve_used, &counters.failures, &counters.passes, &counters.scan_ns,
-                          &counters.fined, &counters.unfined, &counters.fine_failures})
+                          &counters.fined, &counters.unfined, &counters.fine_failures, &counters.shows})
         counter->store(0, std::memory_order_relaxed);
 }
 
@@ -98,6 +105,14 @@ constexpr std::size_t ReserveBlocks = 512;      // 1 GiB
 constexpr std::size_t ReserveAtStart = 16;      // taken as the service starts; the keeper takes the rest
 std::int64_t reserve[ReserveBlocks];
 std::atomic<std::size_t> reserve_count{0};
+// Blocks the graphics caches borrowed when the pool had none left for an image or buffer
+// (eden_guest_memory_lend): the keeper fills the reserve only to ReserveBlocks less these.
+std::atomic<std::size_t> reserve_lent{0};
+// At most three quarters of the reserve is lent: 256 MiB stays for the guest's writes. With all of it
+// lent, a write of the guest (the GPU thread copying a blit into the guest's memory) found no block
+// and ended the session at 155 s (Mario Kart World, 2026-11-01). With half lent, a race start ran out
+// of graphics memory while the other 512 MiB stood unused (reserve_used=0, 2026-11-03).
+constexpr std::size_t ReserveLendable = ReserveBlocks * 3 / 4;
 std::atomic_flag reserve_lock = ATOMIC_FLAG_INIT;
 constexpr std::size_t SharedBlocks = 4096;
 std::int64_t shared_block[SharedBlocks];
@@ -188,6 +203,31 @@ int UnshareBlock(std::int64_t physical) noexcept {
 
 // ---- The changes of a slot (the slot is locked) ----
 
+#ifdef PS5_NATIVE
+// A slot (or a run of them) only reserved again: the zero block no longer counts as mapped.
+bool HideSlots(std::uintptr_t at, std::size_t bytes) noexcept {
+    void* again = reinterpret_cast<void*>(at);
+    return sceKernelReserveVirtualRange(&again, bytes, MAP_FIXED, SparseSlot) == 0 &&
+           again == reinterpret_cast<void*>(at);
+}
+#endif
+// A slot going back to Zero: only reserved where slots can be (the service hides them), else it
+// shows the zero block.
+void ShowNothing(SparseRange& range, std::size_t slot, std::uintptr_t at) noexcept {
+#ifdef PS5_NATIVE
+    if (range.shown != nullptr) {
+        if (!HideSlots(at, SparseSlot)) std::abort();
+        range.shown[slot].store(false, std::memory_order_release);
+        return;
+    }
+    if (!MapSlot(at, PROT_READ, zero_block)) std::abort();
+#else
+    (void)range;
+    (void)slot;
+    (void)at;
+#endif
+}
+
 // Zero -> Own: a zeroed block of its own, read-write.
 bool PromoteZero(SparseRange& range, std::size_t slot) noexcept {
     const std::uintptr_t at = SlotAddress(range, slot);
@@ -255,7 +295,7 @@ void ReturnSlot(SparseRange& range, std::size_t slot) noexcept {
     if (state == SlotFine) {
         const std::size_t kept = FineKept(range, slot);
 #ifdef PS5_NATIVE
-        if (!MapSlot(at, PROT_READ, zero_block)) std::abort();
+        ShowNothing(range, slot, at);
         if (kept != 0 && sceKernelReleaseDirectMemory(range.physical[slot], kept * FinePage) != 0) std::abort();
 #else
         if (madvise(reinterpret_cast<void*>(at), SparseSlot, MADV_DONTNEED) != 0) std::abort();
@@ -266,7 +306,7 @@ void ReturnSlot(SparseRange& range, std::size_t slot) noexcept {
         return;
     }
 #ifdef PS5_NATIVE
-    if (!MapSlot(at, PROT_READ, zero_block)) std::abort();
+    ShowNothing(range, slot, at);
     if (state == SlotShared) {
         if (UnshareBlock(range.physical[slot]) == 0) {
             if (sceKernelReleaseDirectMemory(range.physical[slot], SparseSlot) != 0) std::abort();
@@ -527,6 +567,35 @@ extern "C" void eden_guest_memory_reserve(std::size_t* held, std::size_t* target
 #endif
 }
 
+// The graphics caches found no room for an image or buffer even outside their budget, which ends
+// the session: up to `bytes` of the reserve go back to the pool, and the keeper stops refilling
+// them. The guest's writes then have less headroom; a session that ran out of memory for graphics
+// went with all 1 GiB of the reserve unused. Returns the bytes given back (0: nothing to give).
+extern "C" std::size_t eden_guest_memory_lend(std::size_t bytes) noexcept {
+#ifdef PS5_NATIVE
+    if (service_range.load(std::memory_order_acquire) == nullptr) return 0;
+    std::size_t given = 0;
+    while (given + SparseSlot <= bytes) {
+        Spin(reserve_lock);
+        const std::size_t count = reserve_count.load(std::memory_order_relaxed);
+        std::int64_t physical = -1;
+        if (count > 0 && reserve_lent.load(std::memory_order_relaxed) < ReserveLendable) {
+            physical = reserve[count - 1];
+            reserve_count.store(count - 1, std::memory_order_relaxed);
+            reserve_lent.fetch_add(1, std::memory_order_relaxed);
+        }
+        reserve_lock.clear(std::memory_order_release);
+        if (physical < 0) break;
+        if (sceKernelReleaseDirectMemory(physical, SparseSlot) != 0) std::abort();
+        given += SparseSlot;
+    }
+    return given;
+#else
+    (void)bytes;
+    return 0;
+#endif
+}
+
 // How the waits ended so far, and the writes refused for want of a block (headless/performance.cpp
 // ReportMemory prints them beside what holds the pool).
 extern "C" void eden_guest_memory_waits(unsigned long long* won, unsigned long long* lost,
@@ -568,6 +637,23 @@ bool HandleGuestWriteFault(void* fault) noexcept {
         UnlockSlot(*range, slot, state);
         return true;
     }
+#ifdef PS5_NATIVE
+    // The first access to a Zero slot that is only reserved: it shows the zero block, and the access
+    // repeats (a write faults again, and is promoted then).
+    if (state == SlotZero && range->shown != nullptr && !range->shown[slot].load(std::memory_order_acquire)) {
+        const bool shown = MapSlot(SlotAddress(*range, slot), PROT_READ, zero_block);
+        if (shown) range->shown[slot].store(true, std::memory_order_release);
+        UnlockSlot(*range, slot, state);
+        if (!shown) {
+            Refused(address, 3, state);
+            Note("EDEN_CRAM a slot of the guest's memory could not show the zero block\n");
+            return false;
+        }
+        counters.shows.fetch_add(1, std::memory_order_relaxed);
+        repeats = 0;
+        return true;
+    }
+#endif
     const auto promote = [&]() noexcept {
         bool done = true;
         if (state == SlotFine) {
@@ -669,6 +755,58 @@ bool AddStates(SparseRange& range) noexcept {
     return true;
 }
 
+#ifdef PS5_NATIVE
+// As the service starts, with its fault handler in place: every Zero slot only reserved, in runs (one
+// call each). A slot is marked as not showing the zero block before it stops showing it, so an access
+// meanwhile either reads zeroes or faults and is shown it again.
+void HideZeroSlots(SparseRange& range) noexcept {
+    const std::uintptr_t begin = range.begin.load(std::memory_order_relaxed);
+    const std::size_t slots = (range.end - begin) / SparseSlot;
+    auto* shown = new (std::nothrow) std::atomic<bool>[slots];
+    if (shown == nullptr) return; // they keep showing the zero block
+    for (std::size_t slot = 0; slot < slots; ++slot) shown[slot].store(true, std::memory_order_relaxed);
+    range.shown = shown;
+    std::atomic_thread_fence(std::memory_order_release);
+    std::size_t hidden = 0;
+    for (std::size_t slot = 0; slot < slots;) {
+        if (SlotState(range, slot) != SlotZero) {
+            ++slot;
+            continue;
+        }
+        // The slots of the run locked (a slot promoted meanwhile ends the run), so none changes under it.
+        std::size_t end = slot;
+        while (end < slots && end - slot < 512) {
+            LockSlot(range, end);
+            if (SlotState(range, end) != SlotZero) {
+                UnlockSlot(range, end, SlotState(range, end));
+                break;
+            }
+            ++end;
+        }
+        if (end == slot) {
+            ++slot;
+            continue;
+        }
+        for (std::size_t i = slot; i < end; ++i) shown[i].store(false, std::memory_order_release);
+        const bool ok = HideSlots(begin + slot * SparseSlot, (end - slot) * SparseSlot);
+        if (!ok) {
+            for (std::size_t i = slot; i < end; ++i) shown[i].store(true, std::memory_order_release);
+            // A run the kernel would not reserve again: its slots show the zero block, one by one.
+            for (std::size_t i = slot; i < end; ++i)
+                if (!MapSlot(begin + i * SparseSlot, PROT_READ, zero_block)) std::abort();
+        } else {
+            hidden += end - slot;
+        }
+        for (std::size_t i = slot; i < end; ++i) UnlockSlot(range, i, SlotZero);
+        slot = end;
+    }
+    char line[96];
+    const int length = std::snprintf(line, sizeof(line), "EDEN_CRAM hidden zero slots: %zu of %zu (%zu MiB)\n",
+                                     hidden, slots, hidden * (SparseSlot >> 20));
+    if (length > 0) Report(line);
+}
+#endif
+
 // ---- The scanner ----
 std::thread scanner;
 std::mutex scanner_mutex;
@@ -685,7 +823,7 @@ void ReserveKeeper() {
         scanner_wake.wait_for(lock, std::chrono::milliseconds(100), [] { return scanner_stop; });
         if (scanner_stop) break;
         lock.unlock();
-        FillReserve();
+        FillReserve(ReserveBlocks - std::min(reserve_lent.load(std::memory_order_relaxed), ReserveBlocks));
         lock.lock();
     }
 }
@@ -847,9 +985,10 @@ void ScanPass(SparseRange& range) noexcept {
 
 void ServiceReport(SparseRange& range, const char* when) noexcept {
     const std::size_t slots = (range.end - range.begin.load(std::memory_order_relaxed)) / SparseSlot;
-    std::size_t own = 0, shared = 0, fine = 0, fine_kept = 0;
+    std::size_t own = 0, shared = 0, fine = 0, fine_kept = 0, zero_shown = 0;
     for (std::size_t slot = 0; slot < slots; ++slot) {
         const auto state = SlotState(range, slot);
+        zero_shown += state == SlotZero && (range.shown == nullptr || range.shown[slot].load(std::memory_order_relaxed));
         own += state == SlotOwn;
         shared += state == SlotShared;
         if (state == SlotFine) {
@@ -859,11 +998,12 @@ void ServiceReport(SparseRange& range, const char* when) noexcept {
     }
     char line[640];
     const int length = std::snprintf(line, sizeof(line),
-        "EDEN_CRAM %s held=%zuMiB own=%zu shared=%zu zero=%zu faults=%llu promotions=%llu copies=%llu waits=%llu "
+        "EDEN_CRAM %s held=%zuMiB own=%zu shared=%zu zero=%zu (showing the zero block %zu, first accesses %llu) faults=%llu promotions=%llu copies=%llu waits=%llu "
         "returns_clear=%llu returns_free=%llu returns_scan=%llu dedup=%llu reserve_used=%llu failures=%llu "
         "passes=%llu scan_ms=%llu fine=%zu fine_held=%zuMiB fined=%llu unfined=%llu fine_failures=%llu "
         "reserve=%zuMiB\n",
         when, guest_committed.load(std::memory_order_relaxed) >> 20, own, shared, slots - own - shared - fine,
+        zero_shown, (unsigned long long)counters.shows.load(),
         (unsigned long long)counters.faults.load(), (unsigned long long)counters.promotions.load(),
         (unsigned long long)counters.copies.load(), (unsigned long long)counters.waits.load(),
         (unsigned long long)counters.returns_clear.load(), (unsigned long long)counters.returns_free.load(),
@@ -874,6 +1014,22 @@ void ServiceReport(SparseRange& range, const char* when) noexcept {
         (unsigned long long)counters.unfined.load(), (unsigned long long)counters.fine_failures.load(),
         reserve_count.load(std::memory_order_relaxed) * (SparseSlot >> 20));
     if (length > 0) Report(line);
+#ifdef PS5_NATIVE
+    // The pool as well, from this thread: the GPU thread reports it every 20 s (headless/performance.cpp),
+    // and a session whose GPU thread stopped showed nothing after that.
+    {
+        const std::int64_t total = sceKernelGetDirectMemorySize();
+        std::int64_t start = 0;
+        std::size_t largest = 0;
+        if (total > 0 && sceKernelAvailableDirectMemorySize(0, total, 0x4000, &start, &largest) == 0) {
+            char pool[160];
+            const int pool_length = std::snprintf(pool, sizeof(pool),
+                "EDEN_CRAM %s pool largest free block %zu MiB of %lld MiB\n", when, largest >> 20,
+                static_cast<long long>(total >> 20));
+            if (pool_length > 0) Report(pool);
+        }
+    }
+#endif
     // Who wrote the slots that were promoted: the largest places (offsets in the app's image).
     struct Top { const WriterSite* site; std::uint64_t count; } top[10]{};
     for (const WriterSite& site : writer_sites) {
@@ -1079,10 +1235,14 @@ void ServiceStart(SparseRange& range) noexcept {
     ResetCounters();
     range.promote = true;
 #ifdef PS5_NATIVE
+    reserve_lent.store(0, std::memory_order_relaxed);
     FillReserve(ReserveAtStart);
 #endif
     service_range.store(&range, std::memory_order_release);
     Eden::Fastmem::guest_write_fault.store(&HandleGuestWriteFault, std::memory_order_release);
+#ifdef PS5_NATIVE
+    HideZeroSlots(range); // with the fault handler in place
+#endif
     {
         const std::lock_guard lock{scanner_mutex};
         scanner_stop = false;

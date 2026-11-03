@@ -48,6 +48,7 @@ static bool cpu_mapping_range(void* base, std::size_t size) {
 }
 extern "C" {
 std::int64_t sceKernelGetDirectMemorySize();
+std::int32_t sceKernelAvailableDirectMemorySize(std::int64_t, std::int64_t, std::size_t, std::int64_t*, std::size_t*);
 std::int32_t sceKernelAllocateDirectMemory(std::int64_t, std::int64_t, std::size_t,
                                          std::size_t, int, std::int64_t*);
 std::int32_t sceKernelMapDirectMemory(void**, std::size_t, int, int, std::int64_t, std::size_t);
@@ -277,6 +278,7 @@ struct SparseRange {
     bool promote = false;               // writes to shared slots are promoted (the service runs)
     std::uint16_t* fine = nullptr;      // per slot: 16 KiB pages a Fine slot keeps (low 8 bits), times made whole (bits 8-11)
     std::uint32_t* fine_after = nullptr; // per slot: the scan pass from which it may be made Fine again
+    std::atomic<bool>* shown = nullptr; // per slot, when the service runs (PS5): a Zero slot shows the zero block; else it is only reserved
 };
 std::array<SparseRange, 64> sparse_ranges;
 std::mutex sparse_mutex;
@@ -393,6 +395,8 @@ void ReleaseSparse(SparseRange& range) {
     range.fine = nullptr;
     delete[] range.fine_after;
     range.fine_after = nullptr;
+    delete[] range.shown;
+    range.shown = nullptr;
     range.begin.store(0, std::memory_order_release);
     delete[] range.owned;
     delete[] range.physical;
