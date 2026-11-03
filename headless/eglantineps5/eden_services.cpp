@@ -797,15 +797,13 @@ EdenServices::~EdenServices() {
 pe::ui::Home EdenServices::home() {
     const std::lock_guard lock(bridge_);
     pe::ui::Home home;
-    home.setup_ready = setup_.empty() && Eden::FilesystemAccess();
+    // Keys and firmware are optional: an unpacked game folder needs neither, and a game that does
+    // reports what is missing when it starts. setup_ only says whether they passed (system_status).
+    home.setup_ready = Eden::FilesystemAccess();
     if (!Eden::FilesystemAccess()) {
         // No data is kept anywhere else (storage_paths.h): say so, and start nothing.
         home.status = fill(tr("EglantinePS5 could not get access to the console's storage, so it cannot read your settings, saves and games. Nothing was changed. Close EglantinePS5 and open it again. (Code {0})"),
                            {std::to_string(Eden::FilesystemAccessStatus())});
-    } else if (!home.setup_ready) {
-        home.status = fill(tr("Setup required: {0} Open Settings, Game files to choose the folder that holds your "
-                              "keys, firmware and roms folders (or add the files to {1}), then reopen EglantinePS5."),
-                           {SetupMessage(setup_), Eden::AssetsDir()});
     } else if (launch_error_.starts_with(Eden::Crash::kNotice)) {
         // The previous run ended with a crash report (headless/crash_report.h).
         home.status = fill(tr("EglantinePS5 stopped because of an error. A report was saved to {0}."),
@@ -873,7 +871,7 @@ pe::ui::Home EdenServices::home() {
     const int installed = CountInstalledGames();
     home.system_status = fill(installed == 1 ? tr("{0} game installed") : tr("{0} games installed"),
                               {std::to_string(installed)}) +
-        "  /  " + (home.setup_ready ? tr("Firmware ready") : tr("Setup required"));
+        (setup_.empty() ? std::string{"  /  "} + tr("Firmware ready") : std::string{});
     return home;
 }
 
