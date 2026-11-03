@@ -56,11 +56,13 @@ replace('''                    (double)period / 1e6);
 replace('   wsi->base.get_support =', '   videoout_ref();\n\n   wsi->base.get_support =')
 replace('   if (wsi)\n      vk_free(alloc, wsi);',
         '   if (wsi) {\n      videoout_unref();\n      vk_free(alloc, wsi);\n      wsi_device->wsi[VK_ICD_WSI_PLATFORM_DISPLAY] = NULL;\n   }')
-if sys.argv[1:2] == ['--check']:
+checking = sys.argv[1:2] == ['--check']
+if checking:
     # Is the driver that was built (its recorded display source, EDEN_WSI_SHA256) this adaptation?
     recorded = Path(sys.argv[2]).read_text().split()[0] if Path(sys.argv[2]).is_file() else ''
-    sys.exit(0 if recorded == hashlib.sha256(text.encode()).hexdigest() else 1)
-changed = not target.exists() or target.read_text() != text
+    if recorded != hashlib.sha256(text.encode()).hexdigest():
+        sys.exit(1)
+changed = not checking and (not target.exists() or target.read_text() != text)
 if changed:
     target.write_text(text)
     # Upstream caches the whole build by pin. Invalidate only that receipt;
@@ -68,7 +70,8 @@ if changed:
     provenance = root.parent/'mihawk-vulkan-review/.deps/native/radv-release/PROVENANCE.txt'
     if provenance.exists():
         provenance.replace(provenance.with_suffix('.base.txt'))
-print(f'RADV WSI adaptation changed={changed} sha256={hashlib.sha256(text.encode()).hexdigest()}')
+if not checking:
+    print(f'RADV WSI adaptation changed={changed} sha256={hashlib.sha256(text.encode()).hexdigest()}')
 
 # Preserve the reason behind RADV's successful-but-empty device enumeration.
 # These startup-only diagnostics avoid repeated full game runs for each stage.
@@ -79,6 +82,12 @@ for relative, replacements in {
         ('   if (result == VK_ERROR_INCOMPATIBLE_DRIVER || result == VK_ERROR_INITIALIZATION_FAILED)\n      return VK_SUCCESS;',
          '   if (result != VK_SUCCESS) fprintf(stderr, "radv/ps5: physical device creation result=%d\\n", result);\n   if (result == VK_ERROR_INCOMPATIBLE_DRIVER || result == VK_ERROR_INITIALIZATION_FAILED)\n      return VK_SUCCESS;'),
         ('   if (!pdev->addrlib) {', '   if (!pdev->addrlib) {\n      fprintf(stderr, "radv/ps5: addrlib creation failed\\n");'),
+        # The driver's buffers once: the visible VRAM heap's usage is allocated_vram_vis plus
+        # allocated_vram, and both were the whole of it, so VK_EXT_memory_budget reported twice the
+        # graphics memory (Eden's texture cache saw 6.1 GB of 4 GB and stayed over its limit).
+        ('   heap_info->allocated_vram_vis = driver;',
+         '   /* Counted once: the visible heap adds allocated_vram to this (EglantinePS5). */\n'
+         '   heap_info->allocated_vram_vis = 0;'),
     ],
     'src/amd/vulkan/winsys/ps5/radv_ps5_winsys.c': [
         ('   if (!radv_ps5_platform_init())\n      return;', '   if (!radv_ps5_platform_init()) {\n      fprintf(stderr, "radv/ps5: queue platform initialization failed\\n");\n      return;\n   }'),
@@ -104,9 +113,16 @@ radv_ps5_memory_grant_gpu(void *address, uint64_t bytes)
     for old, new in replacements:
         assert adapted.count(old) == 1, f'Pinned initialization anchor changed: {relative}'
         adapted = adapted.replace(old, new)
+    if checking:
+        # The driver was built from these sources only if they are this adaptation.
+        if destination.read_text() != adapted:
+            sys.exit(1)
+        continue
     if destination.read_text() != adapted:
         destination.write_text(adapted)
         provenance = root.parent/'mihawk-vulkan-review/.deps/native/radv-release/PROVENANCE.txt'
         if provenance.exists():
             provenance.replace(provenance.with_suffix('.base.txt'))
     print(f'RADV initialization diagnostic {relative} sha256={hashlib.sha256(adapted.encode()).hexdigest()}')
+if checking:
+    sys.exit(0)
