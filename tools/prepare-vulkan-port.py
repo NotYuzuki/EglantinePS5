@@ -446,6 +446,20 @@ ALLOCATOR_REFUSED = """    VkResult created = CALL;
             std::fprintf(stderr, "EDEN_GRAPHICS_MEMORY budget refused %llu requests; asked again outside it: result %d, DETAIL\\n",
                          times, int(created), VALUES);
         }
+        // Last: the guest's reserve, 256 MiB at a time (src/guest_memory_service.inc).
+        for (int lent = 0; created != VK_SUCCESS && lent < 4; ++lent) {
+            const std::size_t given = eden_guest_memory_lend(std::size_t{256} << 20);
+            if (given == 0) break;
+            created = AGAIN;
+            std::fprintf(stderr, "EDEN_GRAPHICS_MEMORY lent %llu MiB of the guest's reserve: result %d\\n",
+                         static_cast<unsigned long long>(given >> 20), int(created));
+        }
+        // Then the heap's empty spaces (the CPU's share of the pool), once.
+        if (created != VK_SUCCESS && ::Eden::Performance::TrimHeap("a graphics buffer was refused") != 0) {
+            created = AGAIN;
+            std::fprintf(stderr, "EDEN_GRAPHICS_MEMORY asked again after the heap gave memory back: result %d\\n",
+                         int(created));
+        }
         if (created != VK_SUCCESS) {
             VmaBudget held[VK_MAX_MEMORY_HEAPS]{};
             vmaGetHeapBudgets(allocator, held);
@@ -464,6 +478,8 @@ ALLOCATOR_REFUSED = """    VkResult created = CALL;
                          static_cast<unsigned long long>(guest_held >> 20),
                          static_cast<unsigned long long>(eden_heap_committed() >> 20));
             ::Eden::Performance::ReportHeap("a buffer was refused");
+            ::Eden::Performance::ReportMappings("a buffer was refused", true);
+            DumpAllocatorOnce(allocator);
         }
     }
     vk::Check(created);
@@ -474,8 +490,36 @@ def refused(call, detail, values):
 IMAGE_VALUES = 'ci.extent.width, ci.extent.height, ci.extent.depth, ci.arrayLayers, ci.mipLevels, unsigned(ci.samples), int(ci.format)'
 BUFFER_VALUES = 'static_cast<unsigned long long>(ci.size), unsigned(ci.usage)'
 adapt('src/video_core/vulkan_common/vulkan_memory_allocator.cpp', 'vulkan_memory_allocator.cpp', [
+    # Images too: past the budget and the relaxed request, the guest's reserve, 256 MiB at a time
+    # (src/guest_memory_service.inc), before an image with nothing bound. A Switch 2 game ended on
+    # an ASTC transcode target with the whole 1 GiB reserve unused.
+    ('        result = vmaCreateImage(allocator, &ci, &relaxed, &handle, &allocation, &alloc_info);\n',
+     '        result = vmaCreateImage(allocator, &ci, &relaxed, &handle, &allocation, &alloc_info);\n'
+     '        for (int lent = 0; result == VK_ERROR_OUT_OF_DEVICE_MEMORY && lent < 4; ++lent) {\n'
+     '            const std::size_t given = eden_guest_memory_lend(std::size_t{256} << 20);\n'
+     '            if (given == 0) break;\n'
+     '            result = vmaCreateImage(allocator, &ci, &relaxed, &handle, &allocation, &alloc_info);\n'
+     '            std::fprintf(stderr, "EDEN_GRAPHICS_MEMORY lent %llu MiB of the guest\'s reserve for an image: result %d\\n",\n'
+     '                         static_cast<unsigned long long>(given >> 20), int(result));\n'
+     '        }\n'
+     '        if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && ::Eden::Performance::TrimHeap("a graphics image was refused") != 0) {\n'
+     '            result = vmaCreateImage(allocator, &ci, &relaxed, &handle, &allocation, &alloc_info);\n'
+     '            std::fprintf(stderr, "EDEN_GRAPHICS_MEMORY asked again for an image after the heap gave memory back: result %d\\n", int(result));\n'
+     '        }\n'
+     '        if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {\n'
+     '            ::Eden::Performance::ReportMappings("an image was refused", true);\n'
+     '            DumpAllocatorOnce(allocator);\n'
+     '        }\n'),
     ('#include "video_core/vulkan_common/vulkan_memory_allocator.h"\n',
-     '#include "video_core/vulkan_common/vulkan_memory_allocator.h"\n#include <atomic>\n#include <cstddef>\n#include <cstdio>\n#include "performance.h"\nnamespace Common { void GuestMemoryUsage(std::size_t* span, std::size_t* held) noexcept; }\nextern "C" std::size_t eden_heap_committed(void);\n'),
+     '#include "video_core/vulkan_common/vulkan_memory_allocator.h"\n#include <atomic>\n#include <cstddef>\n#include <cstdio>\n#include "performance.h"\nnamespace Common { void GuestMemoryUsage(std::size_t* span, std::size_t* held) noexcept; }\nextern "C" std::size_t eden_heap_committed(void);\nextern "C" std::size_t eden_guest_memory_lend(std::size_t bytes) noexcept;\n'
+     '// Every allocation the allocator holds (its detailed statistics), once: logs/vma-refused.json.\n'
+     'namespace { void DumpAllocatorOnce(VmaAllocator allocator) {\n'
+     '    static std::atomic<bool> done{false};\n'
+     '    if (done.exchange(true)) return;\n'
+     '    char* text = nullptr;\n'
+     '    vmaBuildStatsString(allocator, &text, VK_TRUE);\n'
+     '    if (text != nullptr) { ::Eden::Performance::WriteLogFile("vma-refused.json", text); vmaFreeStatsString(allocator, text); }\n'
+     '} }\n'),
     # What an image was that the allocator could not make at all, for stderr.log.
     ('    if (result != VK_SUCCESS) {\n        LOG_CRITICAL(Render_Vulkan, "Image {}x{}x{} ({} levels, {} layers, format {}) failed: {}",',
      """    if (result != VK_SUCCESS) {
