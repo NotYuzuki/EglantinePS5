@@ -677,10 +677,13 @@ foreach(bits 32 64)
       # Guest cores 0-2 share a 640 MiB code budget. A64: 256/192/192, since a large
       # open-world game's workers filled 64 MiB on cores 1/2 and evacuated whole caches
       # while streaming. A32 keeps the qualified 512/64/64.
-      # Only the active architecture allocates these caches; core3/host stay 16 MiB.
+      # Only the active architecture allocates these caches. A64 cores 3-5 (Switch 2 titles run
+      # game threads there) get 64 MiB: at 16 MiB, Mario Kart World filled them 75 times in a race
+      # and its cores spent 30-45% of their time compiling the same code again. A cache holds only
+      # the memory its code fills (EDEN_JIT_MEMORY).
       if(PS5_NATIVE)
           if(bits EQUAL 64)
-              set(jit_cache_sizes "m_core_index == 0 ? 256_MiB : m_core_index < 3 ? 192_MiB : 16_MiB")
+              set(jit_cache_sizes "m_core_index == 0 ? 256_MiB : m_core_index < 3 ? 192_MiB : 64_MiB")
           else()
               set(jit_cache_sizes "m_core_index == 0 ? 512_MiB : m_core_index < 3 ? 64_MiB : 16_MiB")
           endif()
