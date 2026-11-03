@@ -741,6 +741,9 @@ int main(int argc, char** argv) {
             // Mario Kart World its 64 MiB blocks held 639 MiB unused in 32 of them, none empty enough to
             // give back, while a 48 MiB staging buffer found no block in the pool.
             setenv("EDEN_VMA_BLOCK_MIB", "16", 0);
+            // PS5 RADV supplies zero backing for unbound sparse pages, so these textures can
+            // stay unbacked until their tiles are used (as in the original PS5 tree).
+            setenv("EDEN_NX2_SPARSE_UNBACKED", "1", 0);
             // Indirect indexed draws estimate at most 64 MiB of indices (EDEN_INDEX_ESTIMATE_MIB): a
             // Switch 2 title's index limit is a whole memory pool (2.4 GB in Donkey Kong Bananza).
             setenv("EDEN_INDEX_ESTIMATE_MIB", "64", 0);
@@ -807,8 +810,8 @@ int main(int argc, char** argv) {
                 } else if (entry.starts_with("idle_spin_us=")) {
                     // Guest cores spin this long on their interrupt flag before sleeping (W1).
                     Eden::Performance::idle_spin_iterations = static_cast<unsigned>(std::stoul(entry.substr(13)) * 50);
-                } else if (entry.starts_with("pc_core=") && entry.size() == 9 && entry[8] >= '0' && entry[8] <= '3') {
-                    // Host PC samples from this guest core instead of core 0 (with --pc-sample).
+                } else if (entry.starts_with("pc_core=") && entry.size() == 9 && entry[8] >= '0' && entry[8] <= '5') {
+                    // Host PC samples from guest core 0-5 (with --pc-sample).
                     Eden::Performance::pc_sample_core = static_cast<unsigned>(entry[8] - '0');
                 } else if (entry == "pc_fast=on") {
                     Eden::Performance::pc_fast = true;

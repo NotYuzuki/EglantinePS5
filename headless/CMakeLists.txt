@@ -919,8 +919,37 @@ if(EDEN_DEV_PROFILE)
     write_derived("${PORT_BUILD_DIR}/hle_service.cpp" "#include \"${EDEN_PORT_DIR}/performance.h\"\n#include \"core/arm/debug.h\"\n${hle_source}")
     list(REMOVE_ITEM core_sources "hle/service/service.cpp")
     list(APPEND core_sources "${PORT_BUILD_DIR}/hle_service.cpp")
+    # Diagnose long guest address waits without enabling high-volume LOG_TRACE or
+    # reading guest memory. Keep all instrumentation out of release builds.
+    file(READ "${PROJECT_SOURCE_DIR}/src/core/hle/kernel/svc/svc_address_arbiter.cpp" address_source)
+    set(address_wait_old "    R_RETURN(\n        GetCurrentProcess(system.Kernel()).WaitAddressArbiter(address, arb_type, value, timeout));")
+    set(address_signal_old "    R_RETURN(GetCurrentProcess(system.Kernel())\n                 .SignalAddressArbiter(address, signal_type, value, count));")
+    foreach(address_anchor IN ITEMS address_wait_old address_signal_old)
+        string(FIND "${address_source}" "${${address_anchor}}" address_at)
+        if(address_at LESS 0)
+            message(FATAL_ERROR "Pinned address arbiter SVC changed: ${address_anchor}")
+        endif()
+    endforeach()
+    string(REPLACE "${address_wait_old}" [=[    auto& trace_thread = GetCurrentThread(system.Kernel());
+    const auto trace_tid = trace_thread.GetThreadId();
+    const auto trace_pc = trace_thread.GetContext().pc;
+    const auto trace_lr = trace_thread.GetContext().lr;
+    const ::Eden::AddressWaitTrace::Wait trace_wait{address};
+    const Result result =
+        GetCurrentProcess(system.Kernel()).WaitAddressArbiter(address, arb_type, value, timeout);
+    trace_wait.Finish(trace_tid, address, static_cast<unsigned>(arb_type), value, timeout_ns,
+                      result.raw, trace_pc, trace_lr);
+    R_RETURN(result);]=] address_source "${address_source}")
+    string(REPLACE "${address_signal_old}" [=[    ::Eden::AddressWaitTrace::Signal(
+        address, GetCurrentThread(system.Kernel()).GetThreadId());
+    R_RETURN(GetCurrentProcess(system.Kernel())
+                 .SignalAddressArbiter(address, signal_type, value, count));]=] address_source "${address_source}")
+    write_derived("${PORT_BUILD_DIR}/svc_address_arbiter.cpp"
+        "#include \"${EDEN_PORT_DIR}/address_wait_trace.h\"\n#include \"core/hle/kernel/k_thread.h\"\n${address_source}")
+    list(REMOVE_ITEM core_sources "hle/kernel/svc/svc_address_arbiter.cpp")
+    list(APPEND core_sources "${PORT_BUILD_DIR}/svc_address_arbiter.cpp")
     file(READ "${PROJECT_SOURCE_DIR}/src/core/hle/kernel/svc/svc_ipc.cpp" ipc_source)
-    set(ipc_old "    R_RETURN(session->SendSyncRequest(kernel, message, buffer_size));")
+    set(ipc_old "    const Result result = session->SendSyncRequest(kernel, message, buffer_size);")
     string(FIND "${ipc_source}" "${ipc_old}" ipc_at)
     if(ipc_at LESS 0)
         message(FATAL_ERROR "Pinned SendSyncRequest changed")
@@ -928,21 +957,24 @@ if(EDEN_DEV_PROFILE)
     # Which guest thread is waiting, not only how long the waits summed to: a frame held up by one
     # thread and a frame with a dozen idle helpers reporting the same total look identical without
     # this, and only one of them can be costing the frame (performance.h).
+    # Include the core's pending-started-thread wait in the guest's IPC latency.
+    # A scope exit preserves both that wait and the original result/return path.
     string(REPLACE "${ipc_old}" [=[    const auto ipc_start = ::Eden::Performance::NowNs();
-    const Result ipc_result = session->SendSyncRequest(kernel, message, buffer_size);
-    const long long ipc_ns = ::Eden::Performance::NowNs() - ipc_start;
-    ::Eden::Performance::AddNs(::Eden::Performance::guest_ipc_wait, ipc_ns);
-    {
-        bool fresh = false;
-        const unsigned ipc_slot =
-            ::Eden::Performance::IpcThreadSlotFor(GetCurrentThread(kernel).GetThreadId(), &fresh);
-        if (fresh) {
-            if (const auto ipc_name = Core::GetThreadName(&GetCurrentThread(kernel)))
-                ::Eden::Performance::SetIpcThreadName(ipc_slot, ipc_name->c_str());
+    SCOPE_EXIT {
+        const long long ipc_ns = ::Eden::Performance::NowNs() - ipc_start;
+        ::Eden::Performance::AddNs(::Eden::Performance::guest_ipc_wait, ipc_ns);
+        {
+            bool fresh = false;
+            const unsigned ipc_slot =
+                ::Eden::Performance::IpcThreadSlotFor(GetCurrentThread(kernel).GetThreadId(), &fresh);
+            if (fresh) {
+                if (const auto ipc_name = Core::GetThreadName(&GetCurrentThread(kernel)))
+                    ::Eden::Performance::SetIpcThreadName(ipc_slot, ipc_name->c_str());
+            }
+            ::Eden::Performance::AddIpcThread(ipc_slot, ipc_ns);
         }
-        ::Eden::Performance::AddIpcThread(ipc_slot, ipc_ns);
-    }
-    R_RETURN(ipc_result);]=] ipc_source "${ipc_source}")
+    };
+    const Result result = session->SendSyncRequest(kernel, message, buffer_size);]=] ipc_source "${ipc_source}")
     write_derived("${PORT_BUILD_DIR}/svc_ipc.cpp" "#include \"${EDEN_PORT_DIR}/performance.h\"\n#include \"core/arm/debug.h\"\n${ipc_source}")
     list(REMOVE_ITEM core_sources "hle/kernel/svc/svc_ipc.cpp")
     list(APPEND core_sources "${PORT_BUILD_DIR}/svc_ipc.cpp")
@@ -997,6 +1029,17 @@ endforeach()
 string(REPLACE "    u64 program_id;\n\n" "" system_source "${system_source}")
 string(REPLACE "        if (app_loader->ReadProgramId(program_id) != Loader::ResultStatus::Success) {\n            LOG_ERROR(Core, \"Failed to find program id for ROM\");\n        }\n\n" "" system_source "${system_source}")
 string(REPLACE "GameSettings::LoadOverrides(program_id," "GameSettings::LoadOverrides(params.program_id," system_source "${system_source}")
+if(PS5_NATIVE)
+    # Guest cores 4 and 5 take CPUs of their own only for Switch 2 titles (headless/performance.cpp).
+    set(old_switch2_flag "        Settings::SetCurrentProgramIsSwitch2(switch2_program);\n")
+    string(FIND "${system_source}" "${old_switch2_flag}" switch2_flag_offset)
+    if(switch2_flag_offset LESS 0)
+        message(FATAL_ERROR "Pinned Switch 2 program detection changed; review guest core placement.")
+    endif()
+    string(REPLACE "${old_switch2_flag}"
+        "${old_switch2_flag}        ::Eden::Performance::ReserveSwitch2Cores(switch2_program);\n" system_source "${system_source}")
+    string(PREPEND system_source "#include \"${EDEN_PORT_DIR}/performance.h\"\n")
+endif()
 # Join callbacks before their service-owned targets can be destroyed.
 set(old_audio_shutdown "        stop_event.request_stop();")
 string(FIND "${system_source}" "${old_audio_shutdown}" audio_shutdown_offset)

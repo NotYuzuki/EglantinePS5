@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "performance.h"
+#include "crash_report.h"
 #include "assets_dir.h"
 #include <glad/glad.h>
 #include <EGL/egl.h>
@@ -650,6 +651,7 @@ void CountPresentedFrame() {
 }
 
 void GraphicsWindow::OnFrameDisplayed() {
+    Eden::Crash::NoteFrame();  // the hang watch's sign of progress
 #ifdef PS5_NATIVE
     if (vulkan) {
         const double now = std::chrono::duration<double>(

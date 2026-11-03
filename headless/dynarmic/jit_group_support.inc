@@ -15,7 +15,7 @@ enum EdenPath : unsigned { EdenRuns, EdenThunks, EdenLookups, EdenHits, EdenCont
 struct alignas(64) EdenPathCounters {
     std::array<std::atomic<unsigned long long>, EdenPathCount> values{};
 };
-std::array<EdenPathCounters, 4> eden_path{};
+std::array<EdenPathCounters, 6> eden_path{};
 void EdenCount(u32 core, EdenPath what, unsigned long long amount = 1) {
     eden_path[core < eden_path.size() ? core : eden_path.size() - 1].values[what].fetch_add(amount, std::memory_order_relaxed);
 }
