@@ -919,6 +919,35 @@ if(EDEN_DEV_PROFILE)
     write_derived("${PORT_BUILD_DIR}/hle_service.cpp" "#include \"${EDEN_PORT_DIR}/performance.h\"\n#include \"core/arm/debug.h\"\n${hle_source}")
     list(REMOVE_ITEM core_sources "hle/service/service.cpp")
     list(APPEND core_sources "${PORT_BUILD_DIR}/hle_service.cpp")
+    # Diagnose long guest address waits without enabling high-volume LOG_TRACE or
+    # reading guest memory. Keep all instrumentation out of release builds.
+    file(READ "${PROJECT_SOURCE_DIR}/src/core/hle/kernel/svc/svc_address_arbiter.cpp" address_source)
+    set(address_wait_old "    R_RETURN(\n        GetCurrentProcess(system.Kernel()).WaitAddressArbiter(address, arb_type, value, timeout));")
+    set(address_signal_old "    R_RETURN(GetCurrentProcess(system.Kernel())\n                 .SignalAddressArbiter(address, signal_type, value, count));")
+    foreach(address_anchor IN ITEMS address_wait_old address_signal_old)
+        string(FIND "${address_source}" "${${address_anchor}}" address_at)
+        if(address_at LESS 0)
+            message(FATAL_ERROR "Pinned address arbiter SVC changed: ${address_anchor}")
+        endif()
+    endforeach()
+    string(REPLACE "${address_wait_old}" [=[    auto& trace_thread = GetCurrentThread(system.Kernel());
+    const auto trace_tid = trace_thread.GetThreadId();
+    const auto trace_pc = trace_thread.GetContext().pc;
+    const auto trace_lr = trace_thread.GetContext().lr;
+    const ::Eden::AddressWaitTrace::Wait trace_wait{address};
+    const Result result =
+        GetCurrentProcess(system.Kernel()).WaitAddressArbiter(address, arb_type, value, timeout);
+    trace_wait.Finish(trace_tid, address, static_cast<unsigned>(arb_type), value, timeout_ns,
+                      result.raw, trace_pc, trace_lr);
+    R_RETURN(result);]=] address_source "${address_source}")
+    string(REPLACE "${address_signal_old}" [=[    ::Eden::AddressWaitTrace::Signal(
+        address, GetCurrentThread(system.Kernel()).GetThreadId());
+    R_RETURN(GetCurrentProcess(system.Kernel())
+                 .SignalAddressArbiter(address, signal_type, value, count));]=] address_source "${address_source}")
+    write_derived("${PORT_BUILD_DIR}/svc_address_arbiter.cpp"
+        "#include \"${EDEN_PORT_DIR}/address_wait_trace.h\"\n#include \"core/hle/kernel/k_thread.h\"\n${address_source}")
+    list(REMOVE_ITEM core_sources "hle/kernel/svc/svc_address_arbiter.cpp")
+    list(APPEND core_sources "${PORT_BUILD_DIR}/svc_address_arbiter.cpp")
     file(READ "${PROJECT_SOURCE_DIR}/src/core/hle/kernel/svc/svc_ipc.cpp" ipc_source)
     set(ipc_old "    const Result result = session->SendSyncRequest(kernel, message, buffer_size);")
     string(FIND "${ipc_source}" "${ipc_old}" ipc_at)
