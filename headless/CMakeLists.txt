@@ -133,6 +133,18 @@ string(REPLACE "    to.impl->previous_fiber = weak_from.lock();"
     "    to.impl->previous_fiber = weak_from.lock();\n    ASSERT(to.impl->previous_fiber);\n    weak_from.reset();" fiber_source "${fiber_source}")
 string(REPLACE "    // \"from\" might no longer be valid if the thread was killed\n    if (auto from = weak_from.lock()) {"
     "    if (auto* from = static_cast<Fiber*>(transfer.data)) {" fiber_source "${fiber_source}")
+# Each guest thread is a fiber whose stacks the heap backs whole: 2 MiB to run on and 2 MiB never
+# switched to (rewind_stack is only set up), 4 MiB for each of a Switch 2 game's ~170 threads, 690 MiB
+# of the 12 GiB the console shares (Mario Kart World, 2026-11-01). 1 MiB to run on (Eden's OpenOrbis
+# build gives 512 KiB) and 64 KiB for the other.
+string(REPLACE "constexpr size_t DEFAULT_STACK_SIZE = 512 * 4096;"
+    "constexpr size_t DEFAULT_STACK_SIZE = 256 * 4096;\nconstexpr size_t REWIND_STACK_SIZE = 16 * 4096;" fiber_source "${fiber_source}")
+string(REPLACE "    std::array<u8, DEFAULT_STACK_SIZE> rewind_stack{};"
+    "    std::array<u8, REWIND_STACK_SIZE> rewind_stack{};" fiber_source "${fiber_source}")
+string(FIND "${fiber_source}" "REWIND_STACK_SIZE> rewind_stack" fiber_rewind_found)
+if(fiber_rewind_found EQUAL -1)
+    message(FATAL_ERROR "fiber.cpp stack anchors changed")
+endif()
 write_derived("${PORT_BUILD_DIR}/fiber.cpp" "${fiber_source}")
 get_target_property(common_sources common SOURCES)
 list(REMOVE_ITEM common_sources fiber.cpp)
