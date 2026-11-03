@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <stdexcept>
 #include <vector>
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <time.h>
@@ -27,6 +28,7 @@
 #include "core/frontend/graphics_context.h"
 #include "core/perf_stats.h"
 #include "video_core/renderer_base.h"
+#include "video_core/gpu_split.h"
 
 // Match the SDK native application's shim: Mesa's C TLS is initialized by
 // compiler-rt; it has no additional C++ per-thread initializer.
@@ -52,12 +54,12 @@ double LoadingCalm() {
     return calm;
 }
 std::atomic<bool> hud_enabled{true};
-HudClock vulkan_hud_clock;
+[[maybe_unused]] HudClock vulkan_hud_clock;
 // What the display is actually given: the guest's frames plus the ones frame generation
 // adds (CountPresentedFrame(), hud.h).
 HudClock vulkan_hud_output_clock;
 HudSnapshot vulkan_hud;
-double vulkan_hud_stats_time{}, vulkan_hud_speed{};
+[[maybe_unused]] double vulkan_hud_stats_time{}, vulkan_hud_speed{};
 bool vulkan_loading{};
 double vulkan_loading_start{-1};
 unsigned vulkan_loading_frames{};
@@ -511,8 +513,27 @@ bool LoadingTick(VideoCore::RendererBase& renderer, bool idle) {
         const bool first = vulkan_loading_start < 0;
         if (first) vulkan_loading_start = now;
         if (vulkan_loading_pace.Due(now, idle)) {
-            vulkan_hud = MakeLoadingSnapshot(now - vulkan_loading_start + LoadingCalm());
-            PresentVulkanLoading(renderer);
+            const HudSnapshot snapshot = MakeLoadingSnapshot(now - vulkan_loading_start + LoadingCalm());
+            // With the GPU thread split (faster GPU emulation) the back thread owns the Vulkan
+            // scheduler: a loading frame drawn here raced the game's first commands there and
+            // the back found the scheduler's chunk gone (title 4). It draws the frame in order
+            // instead, one at a time, and not once the game's first frame ended the loading.
+            if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
+                static std::atomic<bool> pending{};
+                if (!pending.exchange(true, std::memory_order_acq_rel)) {
+                    split.Defer([renderer = &renderer, snapshot] {
+                        if (vulkan_loading) {
+                            vulkan_hud = snapshot;
+                            PresentVulkanLoading(*renderer);
+                        }
+                        pending.store(false, std::memory_order_release);
+                    });
+                    split.Publish();
+                }
+            } else {
+                vulkan_hud = snapshot;
+                PresentVulkanLoading(renderer);
+            }
             ++vulkan_loading_frames;
             if (first) sceSystemServiceHideSplashScreen();
         }
