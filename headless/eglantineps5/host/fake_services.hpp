@@ -8,6 +8,8 @@
 #include "pe/ui/services.hpp"
 
 #include <algorithm>
+#include <thread>
+#include <chrono>
 #include <string>
 #include <utility>
 #include <vector>
@@ -21,6 +23,33 @@ class FakeServices final : public ui::Services
   public:
     // covers_directory receives one drawn cover per sample game.
     explicit FakeServices(const std::string &covers_directory);
+
+    bool nup_preview = false;
+    std::atomic<int> nup_preview_phase{0};
+    bool can_convert_nup(const std::string&) override { return nup_preview; }
+    ui::NupInfo nup_info(const std::string&, const std::atomic<bool>&) override {
+        return {"/data/eglantineps5/roms/DK Bonanza", "/data/eglantineps5/roms/DK Bonanza.nup", "", 18ULL<<30, 159858, 0, false};
+    }
+    std::vector<ui::NupIconEntry> nup_icons(const std::string&) override {
+        return {{"Use detected icon","",false},{"..","/data/eglantineps5/roms",true},
+            {"Custom cover.jpg","/data/eglantineps5/roms/DK Bonanza/Custom cover.jpg",false}};
+    }
+    ui::NupIconSelection nup_icon(const std::string& path) override {
+        return {path,games_.empty() ? std::string{} : games_.front().cover,""};
+    }
+    std::string convert_nup(const std::string&,bool,const std::string&,const std::atomic<bool>& stop,
+                           const std::function<void(const ui::NupProgress&)>& progress) override {
+        int previous=-1; std::uint64_t ticks=0;
+        while (!stop.load()) {
+            const int phase=nup_preview_phase.load();
+            if (phase>=2) return "NUP conversion verified. The source folder was kept.";
+            if (phase!=previous) { ticks=0; previous=phase; }
+            progress({(phase ? 11ULL<<30 : 3ULL<<30)+(ticks<<20),18ULL<<30,
+                      (phase ? 90000ULL : 29484ULL)+ticks,159858,phase==1});
+            ++ticks; std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        return "Conversion cancelled. The source folder was kept.";
+    }
 
     // What the preview varies between pictures.
     bool setup_ready = true;

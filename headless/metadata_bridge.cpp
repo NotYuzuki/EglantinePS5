@@ -1,3 +1,4 @@
+#include "core/loader/nup.h"
 #include "extracted_game.h"
 #include "game_name.h"
 #include "metadata_bridge.h"
@@ -202,6 +203,11 @@ uint64_t eden_game_title_id(const char* rom_path) {
     std::string path = rom_path;
     std::transform(path.begin(), path.end(), path.begin(),
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (path.ends_with(".nup")) {
+        Loader::AppLoader_NUP loader(file);
+        uint64_t id = 0;
+        return loader.ReadProgramId(id) == Loader::ResultStatus::Success ? id : 0;
+    }
     if (path.ends_with(".xci")) {
         FileSys::XCI image(file);
         return image.GetStatus() == Loader::ResultStatus::Success ? image.GetProgramTitleID() : 0;
@@ -225,6 +231,19 @@ int eden_extract_game_metadata(const char* rom_path, const char* keys_dir,
     std::string path = rom_path;
     std::transform(path.begin(), path.end(), path.begin(),
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (path.ends_with(".nup")) {
+        Loader::AppLoader_NUP loader(file);
+        std::string name;
+        std::vector<u8> icon;
+        int result = 0;
+        if (loader.ReadTitle(name) == Loader::ResultStatus::Success) {
+            std::snprintf(title, title_capacity, "%s", name.c_str());
+            result |= EDEN_METADATA_TITLE;
+        }
+        if (loader.ReadIcon(icon) == Loader::ResultStatus::Success &&
+            WriteTgaBytes(icon.data(), icon.size(), cover_tga_path, 512)) result |= EDEN_METADATA_COVER;
+        return result;
+    }
     const bool xci = path.size() >= 4 && path.substr(path.size() - 4) == ".xci";
     const auto romfs = OpenControlRomFs(file, xci);
     if (!romfs) return 0;

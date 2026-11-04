@@ -130,7 +130,7 @@ bool GameFileName(const std::string& name) {
     for (const unsigned char c : name)
         if (c < 32 || c == 127 || c == '/' || c == '\\') return false;
     const std::string extension = Lower(name.substr(name.size() - 4));
-    return extension == ".nsp" || extension == ".xci";
+    return extension == ".nsp" || extension == ".xci" || extension == ".nup";
 }
 
 // A name as one part of a path: letters, digits, '-' and '_' stay, the rest is %XX.

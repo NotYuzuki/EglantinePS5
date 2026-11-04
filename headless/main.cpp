@@ -531,7 +531,7 @@ int main(int argc, char** argv) {
             for (const auto& entry : Eden::ReadNativeDirectory(folder, rom_error)) {
                 const auto filename = entry.path().filename().string();
                 const auto extension = entry.path().extension();
-                if (extension != ".nsp" && extension != ".xci") continue;
+                if (extension != ".nsp" && extension != ".xci" && extension != ".nup") continue;
                 const auto path = folder + "/" + filename;
                 if (filename.find(development_id) != std::string::npos ||
                     eden_game_title_id(path.c_str()) == development_title) {

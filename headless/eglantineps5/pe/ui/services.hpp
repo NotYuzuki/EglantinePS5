@@ -7,6 +7,7 @@
 #include "pe/gfx/image.hpp"
 
 #include <array>
+#include <functional>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -62,6 +63,18 @@ struct UpdateStatus
     std::uint64_t total = 0; // 0 while not known
     std::string error;       // why it failed (English, technical)
 };
+
+struct NupInfo {
+    std::string source, target, error;
+    std::uint64_t bytes = 0, files = 0, available = 0;
+    bool available_known = false;
+};
+struct NupProgress {
+    std::uint64_t bytes = 0, total = 0, files = 0, files_total = 0;
+    bool verifying = false;
+};
+struct NupIconEntry { std::string name, path; bool directory = false; };
+struct NupIconSelection { std::string path, preview, error; };
 
 // A game file in the games folder.
 struct Game
@@ -421,6 +434,14 @@ class Services
     }
 
     // ---- library ----
+    virtual bool can_convert_nup(const std::string&) { return false; }
+    virtual NupInfo nup_info(const std::string&, const std::atomic<bool>&) { return {}; }
+    virtual std::vector<NupIconEntry> nup_icons(const std::string&) { return {}; }
+    virtual NupIconSelection nup_icon(const std::string&) { return {}; }
+    virtual std::string convert_nup(const std::string&, bool, const std::string&, const std::atomic<bool>&,
+                                   const std::function<void(const NupProgress&)>&) {
+        return "NUP conversion is unavailable.";
+    }
     virtual std::vector<Game> games() = 0; // reads every game file: slow
     // The value the launcher hands back to start a game.
     virtual std::string game_path(const std::string &file) = 0;

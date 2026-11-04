@@ -27,6 +27,13 @@ public:
     unsigned controllers() override;
     std::string version() override;
 
+    bool can_convert_nup(const std::string& file) override;
+    pe::ui::NupInfo nup_info(const std::string&, const std::atomic<bool>&) override;
+    std::vector<pe::ui::NupIconEntry> nup_icons(const std::string&) override;
+    pe::ui::NupIconSelection nup_icon(const std::string&) override;
+    std::string convert_nup(const std::string& file, bool compressed, const std::string& icon,
+                           const std::atomic<bool>& stop,
+                           const std::function<void(const pe::ui::NupProgress&)>& progress) override;
     std::vector<pe::ui::Game> games() override;
     std::string game_path(const std::string& file) override;
     bool game_exists(const std::string& file) override;

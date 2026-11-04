@@ -43,6 +43,7 @@ enum GameRow : int
     row_language,
     row_mods,
     row_save,   // in builds that move saves
+    row_convert,
     row_delete, // a game a download source has: deleted from the console
 };
 constexpr float kDialogRowsTop = 334.0f;
@@ -297,6 +298,8 @@ void Launcher::enter_library()
 
 void Launcher::refresh_selected_game()
 {
+    selected_nup_ = !games_.empty() && !games_[static_cast<std::size_t>(library_.selected)].remote &&
+        services_.can_convert_nup(games_[static_cast<std::size_t>(library_.selected)].file);
     const std::uint64_t id =
         games_.empty() ? 0 : games_[static_cast<std::size_t>(library_.selected)].title_id;
     selected_docked_ = id == 0 || services_.docked(id);
@@ -326,8 +329,10 @@ void Launcher::press_library(Key key)
             cue(Cue::focus);
         }
         return;
-    case Key::l1:
     case Key::r1:
+        if (game && selected_nup_) { open_nup(); return; }
+        [[fallthrough]];
+    case Key::l1:
         if (library_.page(key == Key::r1 ? 1 : -1))
         {
             message_.clear();
@@ -671,6 +676,13 @@ void Launcher::draw_library(Canvas &c)
         draw_footer(c, download != nullptr ? kQueued : kRemote, 4);
         return;
     }
+    if (game && selected_nup_) {
+        static constexpr Hint kConvertHints[] = {{Pad::cross, TR("Select")}, {Pad::circle, TR("Back")},
+            {Pad::updown, TR("Browse games")}, {Pad::r1, TR("Convert to NUP")},
+            {Pad::square, TR("Mods")}, {Pad::triangle, TR("Game settings")}};
+        draw_footer(c, kConvertHints, 6);
+        return;
+    }
     static constexpr Hint kHints[] = {{Pad::cross, TR("Select")},
                                       {Pad::circle, TR("Back")},
                                       {Pad::updown, TR("Browse games")},
@@ -684,15 +696,22 @@ void Launcher::draw_library(Canvas &c)
 
 int Launcher::game_row(int row) const
 {
-    if (row < row_save)
-        return row;
-    return services_.save_transfer_available() ? row : row + 1;
+    for (int kind = 0; kind <= row_delete; ++kind) {
+        if (kind == row_save && !services_.save_transfer_available()) continue;
+        if (kind == row_convert && !selected_nup_) continue;
+        if (row-- == 0) return kind;
+    }
+    return row_delete;
 }
 
 void Launcher::press_game(Key key)
 {
     Game &game = games_[static_cast<std::size_t>(library_.selected)];
     const int kind = game_row(option_);
+    if (kind == row_convert && (key == Key::cross || key == Key::square)) {
+        open_nup(key == Key::square);
+        return;
+    }
     switch (key)
     {
     case Key::circle:
@@ -858,12 +877,13 @@ void Launcher::draw_game(Canvas &c, float open)
                   std::to_string(mods_.size())}),
         import_source_ == SaveSource::ryujinx ? tr("Ryujinx save found") :
         import_source_ == SaveSource::folder ? tr("Save folder found") : tr("Nothing to import"),
+        tr("Raw or compressed copy"),
         game != nullptr ? game->size : std::string{},
     };
     static constexpr const char *kLabels[] = {TR("Console mode"), TR("Video"),    TR("Performance"),
                                               TR("Audio"),        TR("Controls"), TR("System"),
                                               TR("Language"),     TR("Mods"),     TR("Save data"),
-                                              TR("Delete from console")};
+                                              TR("Convert to NUP"), TR("Delete from console")};
     // Five rows show; the list scrolls to the others.
     list.push_clip({kDialogWindow.x - 24.0f, kDialogWindow.y - 6.0f, kDialogWindow.w + 48.0f,
                     kDialogWindow.h + 12.0f});
@@ -911,6 +931,10 @@ void Launcher::draw_game(Canvas &c, float open)
         notice_block(c, message_, 592.0f, kDialogHints - 6.0f, theme::kSmall, 26.0f,
                      message_warning_ ? theme::kWarning : theme::kLimePale, 736.0f, 2,
                      message_warning_);
+    }
+    else if (game_row(option_) == row_convert) {
+        static constexpr Hint kConvert[] = {{Pad::cross, TR("Raw copy")}, {Pad::square, TR("Compressed copy")}, {Pad::circle, TR("Back")}};
+        draw_hints(c, kConvert, 3, 592.0f, kDialogHints, theme::kCopy, 736.0f);
     }
     else if (game_row(option_) == row_delete)
     {

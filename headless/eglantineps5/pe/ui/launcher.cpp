@@ -53,6 +53,11 @@ Launcher::Launcher(Services &services, Textures &textures, const Fonts &fonts, b
 
 Launcher::~Launcher()
 {
+    nup_stop_ = true;
+    if (nup_info_request_.valid()) nup_info_request_.wait();
+    if (nup_icons_request_.valid()) nup_icons_request_.wait();
+    if (nup_icon_request_.valid()) nup_icon_request_.wait();
+    if (nup_conversion_.valid()) nup_conversion_.wait();
     room_directory_stop_ = true;
     if (room_directory_request_.valid()) room_directory_request_.wait();
     room_edit_stop_ = true;
@@ -219,6 +224,7 @@ void Launcher::press(Key key)
         }
         return;
     }
+    if (modal_ == Modal::nup) return press_nup(key);
     if (modal_ == Modal::game)
         return press_game(key);
     if (modal_ == Modal::mods)
@@ -279,6 +285,7 @@ void Launcher::update(float dt)
     poll_pairing(dt);
     refresh_sync_setup(dt);
     update_multiplayer();
+    poll_nup_conversion();
     update_game_options();
     update_nfs();
     update_prepare(dt);
@@ -527,7 +534,9 @@ void Launcher::draw(gfx::DrawList &list)
     {
         const float opened = tween::clamp01(modal_open_.value);
         list.rounded_rect(kScreen, 0.0f, theme::kScrim.with_alpha(0.69f * opened));
-        if (modal_shown_ == Modal::game)
+        if (modal_shown_ == Modal::nup)
+            draw_nup(c, opened);
+        else if (modal_shown_ == Modal::game)
             draw_game(c, opened);
         else if (modal_shown_ == Modal::mods)
             draw_mods(c, opened);
