@@ -1,3 +1,5 @@
+#include <thread>
+#include <chrono>
 // EglantinePS5 - Launcher preview on a PC: draws the real screens to PNG files.
 // Copyright (C) 2026 BlackBearReloaded
 // SPDX-License-Identifier: GPL-3.0-or-later
@@ -1188,6 +1190,28 @@ int main(int argc, char **argv)
                 output, nullptr, {}, {}, make_tour, true, {}};
     stage.pixels.resize(static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4);
     stbi_flip_vertically_on_write(1);
+    if (std::getenv("PE_NUP_PREVIEW")) {
+        services.nup_preview=true;
+        const auto nup_shoot = [&](const char* name) {
+            // Let asynchronous covers and the font atlas settle, as they do during real gameplay UI frames.
+            for (int i=0;i<16;++i) { stage.frame(); stage.render(); std::this_thread::sleep_for(std::chrono::milliseconds(10)); }
+            stage.shoot(name);
+        };
+        stage.restart(); stage.wait(1.0f); stage.press({Key::up,Key::cross}); stage.wait(1.0f);
+        stage.press({Key::r1}); std::this_thread::sleep_for(std::chrono::milliseconds(30)); stage.wait(1.0f);
+        nup_shoot("nup-setup");
+        stage.press({Key::up,Key::cross}); std::this_thread::sleep_for(std::chrono::milliseconds(30)); stage.wait(0.6f);
+        nup_shoot("nup-icon-picker");
+        stage.press({Key::down,Key::down,Key::cross}); std::this_thread::sleep_for(std::chrono::milliseconds(30)); stage.wait(0.6f);
+        stage.press({Key::down,Key::cross}); std::this_thread::sleep_for(std::chrono::milliseconds(600)); stage.wait(0.6f);
+        nup_shoot("nup-converting");
+        services.nup_preview_phase=1; std::this_thread::sleep_for(std::chrono::milliseconds(30)); stage.frame();
+        std::this_thread::sleep_for(std::chrono::milliseconds(600)); stage.wait(0.6f);
+        nup_shoot("nup-verifying");
+        services.nup_preview_phase=2; std::this_thread::sleep_for(std::chrono::milliseconds(30)); stage.wait(0.6f);
+        nup_shoot("nup-complete");
+        return stage.ok ? 0 : 1;
+    }
     const char *which_tour = std::getenv("PE_TOUR");
     if (make_tour && which_tour && std::strcmp(which_tour, "update") == 0)
         update_tour(stage);

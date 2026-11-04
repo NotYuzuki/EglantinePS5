@@ -452,6 +452,7 @@ int Launcher::dialog_rows(Modal modal) const
         // builds that move saves.
         // A game a download source has can be deleted from the console (and downloaded again).
         return (services_.save_transfer_available() ? 9 : 8) +
+               (selected_nup_ ? 1 : 0) +
                (library_.selected < static_cast<int>(games_.size()) &&
                         !games_[static_cast<std::size_t>(library_.selected)].sources.empty() &&
                         !games_[static_cast<std::size_t>(library_.selected)].remote ? 1 : 0);

@@ -9,6 +9,7 @@
 #include "pe/ui/widgets.hpp"
 
 #include <array>
+#include <chrono>
 #include <future>
 #include <string>
 #include <vector>
@@ -79,6 +80,7 @@ class Launcher
         accessibility,
         diagnostics,
         game,
+        nup,
         mods,         // a game's mods, opened from its settings
         game_options, // one category of a game's own settings, opened from its settings
         mapping,      // the button mapping: Settings > Controls', or a game's own
@@ -169,6 +171,30 @@ class Launcher
     void press_library(Key key);
     void draw_library(Canvas &c);
     void refresh_selected_game();
+    void open_nup(bool compressed = false);
+    void press_nup(Key key);
+    void draw_nup(Canvas& c, float open);
+    void browse_nup_icons(const std::string& path);
+    void poll_nup_conversion();
+    NupInfo nup_info_;
+    Game nup_game_;
+    std::future<NupInfo> nup_info_request_;
+    std::future<std::vector<NupIconEntry>> nup_icons_request_;
+    std::future<NupIconSelection> nup_icon_request_;
+    std::vector<NupIconEntry> nup_icons_;
+    std::string nup_icon_directory_, nup_icon_path_, nup_icon_preview_, nup_result_;
+    ListView nup_icon_rows_;
+    bool selected_nup_ = false;
+    bool nup_compressed_ = false, nup_picker_ = false, nup_completed_ = false;
+    int nup_option_ = 2;
+    std::chrono::steady_clock::time_point nup_sample_clock_{};
+    std::uint64_t nup_sample_bytes_ = 0;
+    double nup_speed_ = 0;
+    bool nup_sample_verifying_ = false;
+    std::atomic<std::uint64_t> nup_files_{0}, nup_files_total_{0};
+    std::future<std::string> nup_conversion_;
+    std::atomic<bool> nup_stop_{false}, nup_validating_{false};
+    std::atomic<std::uint64_t> nup_done_{0}, nup_total_{0};
     void press_game(Key key);
     void draw_game(Canvas &c, float open);
     // What a row of the game settings dialog is (GameRow in library.cpp): Save data is there in

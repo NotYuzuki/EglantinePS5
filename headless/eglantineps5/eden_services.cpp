@@ -1,4 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include <fstream>
+#include <limits>
+#include "nup_space.h"
+#include "core/file_sys/nup_writer.h"
+#include "core/file_sys/nup_container.h"
+#include "core/file_sys/vfs/vfs_real.h"
 #include "../nfs/nfs.h"
 #include "../ntfs/ntfsfs.h"
 #include "eden_services.h"
@@ -1074,7 +1080,7 @@ std::vector<pe::ui::Game> EdenServices::games() {
         std::string format = file.substr(dot + 1);
         std::transform(format.begin(), format.end(), format.begin(),
                        [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
-        if (format != "NSP" && format != "XCI" && format != "DIR") continue;
+        if (format != "NSP" && format != "XCI" && format != "DIR" && format != "NUP") continue;
         const std::string path = RomPath(file);
         struct stat info {};
         if (stat(path.c_str(), &info) != 0 || !S_ISREG(info.st_mode)) continue;
@@ -1445,7 +1451,7 @@ pe::ui::FolderInfo EdenServices::folder_info(const std::string& directory) {
     pe::ui::FolderInfo info;
     info.keys = Eden::FileExists(JoinPath(directory, "keys/prod.keys"));
     info.firmware = CountFiles(JoinPath(directory, "firmware"), {".nca"});
-    info.games = CountFiles(JoinPath(directory, "roms"), {".nsp", ".xci"});
+    info.games = CountFiles(JoinPath(directory, "roms"), {".nsp", ".xci", ".nup"});
     return info;
 }
 
@@ -2062,4 +2068,170 @@ bool EdenServices::unlink_profile(int profile_index) {
     const bool unlinked = Eden::SaveSync::SetEntry(profile.Key(), Eden::SaveSync::Json::object());
     if (unlinked) Eden::Report("save sync", ("unlinked " + profile.name).c_str());
     return unlinked;
+}
+
+bool EdenServices::can_convert_nup(const std::string& file) {
+    if (!IsFolderGame(file)) return false;
+    const auto path = game_path(file);
+    // The converter uses native filesystem operations; network aliases and NTFS readers are read-only here.
+    if (!path.starts_with(Eden::AssetsPath("roms") + "/")) return false;
+    return FileSys::Nup::DumpRootFromMain(path).has_value();
+}
+
+
+pe::ui::NupInfo EdenServices::nup_info(const std::string& file, const std::atomic<bool>& stop) {
+    pe::ui::NupInfo info;
+    try {
+        const auto root = FileSys::Nup::DumpRootFromMain(game_path(file));
+        if (!root) { info.error = "The extracted game could not be found."; return info; }
+        info.source = root->string();
+        info.target = FileSys::Nup::DefaultArchivePath(*root).string();
+        if (const auto space = Eden::NupSpace::Available(root->parent_path())) {
+            info.available_known = true; info.available = *space;
+        }
+        std::error_code error;
+        for (std::filesystem::recursive_directory_iterator it(*root, error), end; !error && it != end; it.increment(error)) {
+            if (stop.load()) { info.error = "Scanning cancelled."; return info; }
+            if (it->is_symlink()) { info.error = "Conversion does not follow symbolic links."; return info; }
+            if (it->is_regular_file() && it->path().filename() != ".listing") {
+                const auto size = it->file_size();
+                if (size > std::numeric_limits<std::uint64_t>::max() - info.bytes - (16ULL << 20))
+                    throw std::runtime_error("Source size is too large.");
+                info.bytes += size; ++info.files;
+            }
+        }
+        if (error) info.error = "Could not read the source folder.";
+        else if (std::filesystem::exists(info.target)) info.error = "The target already exists. Move it before converting again.";
+    } catch (const std::exception& e) { info.error = e.what(); }
+    return info;
+}
+
+std::vector<pe::ui::NupIconEntry> EdenServices::nup_icons(const std::string& directory) {
+    std::vector<pe::ui::NupIconEntry> entries;
+    std::error_code error;
+    for (std::filesystem::directory_iterator it(directory, error), end; !error && it != end; it.increment(error)) {
+        if (entries.size() >= 512) break;
+        if (it->is_symlink(error)) continue;
+        const bool folder = it->is_directory(error);
+        auto extension = it->path().extension().string();
+        std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char c) { return std::tolower(c); });
+        if (folder || extension == ".png" || extension == ".jpg" || extension == ".jpeg")
+            entries.push_back({it->path().filename().string(), it->path().string(), folder});
+    }
+    std::sort(entries.begin(), entries.end(), [](const auto& a, const auto& b) {
+        return a.directory != b.directory ? a.directory : a.name < b.name;
+    });
+    const auto parent = std::filesystem::path(directory).parent_path();
+    if (!parent.empty() && parent != directory) entries.insert(entries.begin(), {"..", parent.string(), true});
+    entries.insert(entries.begin(), {"Use detected icon", "", false});
+    return entries;
+}
+
+namespace {
+std::vector<unsigned char> NupIconBytes(const std::string& path) {
+    auto extension = std::filesystem::path(path).extension().string();
+    std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char c) { return std::tolower(c); });
+    if (extension != ".png" && extension != ".jpg" && extension != ".jpeg") throw std::runtime_error("Choose a PNG or JPEG image.");
+    const auto size = std::filesystem::file_size(path);
+    if (!size || size > (8ULL << 20)) throw std::runtime_error("Choose an icon smaller than 8 MiB.");
+    std::vector<unsigned char> bytes(static_cast<std::size_t>(size));
+    std::ifstream input(path, std::ios::binary);
+    if (!input.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(size)))
+        throw std::runtime_error("Could not read the selected icon.");
+    return bytes;
+}
+}
+
+pe::ui::NupIconSelection EdenServices::nup_icon(const std::string& path) {
+    pe::ui::NupIconSelection result;
+    try {
+        const auto bytes = NupIconBytes(path);
+        const auto hash = std::hash<std::string_view>{}({reinterpret_cast<const char*>(bytes.data()), bytes.size()});
+        const auto preview = Eden::CoversDir() + "/nup-icon-" + std::to_string(hash) + ".tga";
+        std::filesystem::create_directories(Eden::CoversDir());
+        if (!eden_write_cover_tga(bytes.data(), bytes.size(), preview.c_str()))
+            throw std::runtime_error("Could not decode the selected icon (maximum 4096 pixels per side).");
+        result.path = path; result.preview = preview;
+    } catch (const std::exception& e) { result.error = e.what(); }
+    return result;
+}
+
+std::string EdenServices::convert_nup(const std::string& file, bool compressed, const std::string& icon,
+                                     const std::atomic<bool>& stop,
+                                     const std::function<void(const pe::ui::NupProgress&)>& progress) {
+    const std::lock_guard lock(bridge_);
+    try {
+        if (!can_convert_nup(file)) return "Conversion is available for extracted games in the game files folder.";
+        const auto source = FileSys::Nup::DumpRootFromMain(game_path(file));
+        if (!source) return "The extracted game could not be found.";
+        const auto output = FileSys::Nup::DefaultArchivePath(*source);
+        if (std::filesystem::exists(output)) return "A NUP file already exists. Move it before converting again.";
+        // Discovery in the packer validates every member. Avoid another full-tree stat pass on PS5.
+        if (Eden::NupSpace::Available(output.parent_path())) {
+            const auto info = nup_info(file, stop);
+            if (!info.error.empty()) return info.error;
+            std::uint64_t reusable = 0;
+            std::error_code part_error;
+            const auto part = std::filesystem::path(output.string() + ".part");
+            if (!std::filesystem::is_symlink(part, part_error) && std::filesystem::is_regular_file(part, part_error))
+                reusable = std::filesystem::file_size(part, part_error);
+            if (part_error) reusable = 0;
+            if (info.available_known && Eden::NupSpace::Insufficient(info.available, info.bytes + (16ULL << 20), reusable))
+                return "Not enough free space for a verified copy. The source folder will be kept.";
+        }
+        FileSys::Nup::PackOptions options;
+        options.delete_sources = false;
+        options.measure_io = true;
+        options.descriptor_output = true;
+        options.zstd_level = compressed ? 1 : 0;
+        options.raw_threshold = 8ULL << 20;
+        if (!icon.empty()) {
+            const auto selected = nup_icon(icon);
+            if (!selected.error.empty()) return selected.error;
+            options.metadata.icon = NupIconBytes(icon);
+        }
+        std::string detail;
+        Eden::Report("nup", compressed ? "start mode=compressed output=descriptor chunk_kib=256" : "start mode=raw output=descriptor chunk_kib=256");
+        auto next_io_log = std::chrono::steady_clock::now();
+        const auto packed = FileSys::Nup::PackDump(*source, output, options,
+            [&](const FileSys::Nup::PackProgress& p) {
+                progress({p.bytes_done, p.bytes_total, p.files_done, p.files_total, false});
+                const auto now = std::chrono::steady_clock::now();
+                if (now < next_io_log && p.files_done != p.files_total) return;
+                next_io_log = now + std::chrono::seconds(5);
+                const auto& io = p.io;
+                char line[900];
+                std::snprintf(line, sizeof(line),
+                    "phase=pack files=%llu/%llu bytes=%llu/%llu elapsed_ms=%llu discovery_ms=%llu count_ms=%llu file_ms=%llu open_ms=%llu stat_ms=%llu read_ms=%llu write_ms=%llu seek_ms=%llu hash_ms=%llu opens=%llu reads=%llu writes=%llu seeks=%llu skipped_seeks=%llu",
+                    (unsigned long long)p.files_done, (unsigned long long)p.files_total,
+                    (unsigned long long)p.bytes_done, (unsigned long long)p.bytes_total,
+                    (unsigned long long)(io.elapsed_us / 1000), (unsigned long long)(io.discovery_us / 1000),
+                    (unsigned long long)(io.count_us / 1000), (unsigned long long)(io.file_us / 1000),
+                    (unsigned long long)(io.open_us / 1000), (unsigned long long)(io.stat_us / 1000),
+                    (unsigned long long)(io.read_us / 1000), (unsigned long long)(io.write_us / 1000),
+                    (unsigned long long)(io.seek_us / 1000), (unsigned long long)(io.hash_us / 1000),
+                    (unsigned long long)io.open_calls, (unsigned long long)io.read_calls,
+                    (unsigned long long)io.write_calls, (unsigned long long)io.seek_calls,
+                    (unsigned long long)io.skipped_seeks);
+                Eden::Report("nup", line);
+            }, &stop, &detail);
+        Eden::Report("nup", ("pack result=" + std::to_string(static_cast<int>(packed))).c_str());
+        if (packed == FileSys::Nup::PackResult::Cancelled) return "Conversion cancelled. The source folder was kept.";
+        if (packed != FileSys::Nup::PackResult::Success) return "Conversion failed: " + detail;
+        FileSys::RealVfsFilesystem vfs;
+        FileSys::NupContainer archive(vfs.OpenFile(output.string(), FileSys::OpenMode::Read));
+        if (archive.GetStatus() != Loader::ResultStatus::Success) return "The NUP file failed validation. The source folder was kept.";
+        Eden::Report("nup", "phase=verify start");
+        pe::ui::NupProgress current; current.verifying = true;
+        progress(current);
+        const auto verified = archive.VerifyIntegrity([&](std::size_t done, std::size_t total) {
+            current.files = done; current.files_total = total; progress(current); return !stop.load();
+        }, [&](u64 done, u64 total) {
+            current.bytes = done; current.total = total; progress(current);
+        });
+        Eden::Report("nup", ("verify result=" + std::to_string(static_cast<int>(verified))).c_str());
+        if (stop.load()) return "Validation cancelled. The NUP file is complete but not verified. The source folder was kept.";
+        if (verified != Loader::ResultStatus::Success) return "The NUP file failed validation. The source folder was kept.";
+        return "NUP conversion verified. The source folder was kept.";
+    } catch (const std::exception& e) { return std::string("Conversion failed: ") + e.what(); }
 }
