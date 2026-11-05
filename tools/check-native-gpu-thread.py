@@ -51,7 +51,11 @@ assert 'GPU::~GPU() { impl->NotifyShutdown(); }' in gpu
 shutdown = gpu.split('    void NotifyShutdown() {', 1)[1].split('    /// Obtain', 1)[0]
 assert 'sync_cv.notify_all();\n        }\n        gpu_thread.Stop();' in shutdown
 assert shutdown.index('gpu_thread.Stop();') < shutdown.index('sync_requests.clear();') < shutdown.index('sync_requests_stopped = true;')
-assert '~Impl() { gpu_thread.Stop(); if (renderer && Settings::IsOpenGL()) { renderer->Context().MakeCurrent(); glFinish(); } }' in gpu
+# ~Impl stops the worker through NotifyShutdown (checked above), drains OpenGL, then resets the renderer.
+destructor = gpu.split('    ~Impl() {\n', 1)[1].split('\n    }\n', 1)[0]
+assert destructor.startswith('        NotifyShutdown();\n        if (renderer && Settings::IsOpenGL()) {\n'
+                             '            renderer->Context().MakeCurrent();\n            glFinish();\n        }\n')
+assert destructor.rstrip().endswith('renderer.reset();')
 core = (cache / 'native-local/headless/core.cpp').read_text()
 shutdown_core = core.split('    void ShutdownMainProcess() {', 1)[1].split('    bool IsShuttingDown()', 1)[0]
 assert shutdown_core.index('gpu_core->NotifyShutdown()') < shutdown_core.index('services.reset()') < shutdown_core.index('gpu_core.reset()')

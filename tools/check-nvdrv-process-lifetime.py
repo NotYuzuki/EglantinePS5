@@ -22,6 +22,7 @@ struct Mapper {DAddr GetRegionStart(){return 4096;}size_t GetRegionSize(){return
 struct Session {SessionId id;Kernel::KProcess* process;Core::Asid asid;bool has_preallocated_area{};std::unique_ptr<Mapper> mapper;bool is_active{};int ref_count{};Session(SessionId i,Kernel::KProcess*p,Core::Asid a):id(i),process(p),asid(a){}};
 struct Smmu {std::vector<Kernel::KProcess*> owners;Core::Asid RegisterProcess(int*p){for(size_t i=0;i<owners.size();++i)if(&owners[i]->memory==p){owners[i]->registered=true;return {i};}assert(false);return{};}void UnregisterProcess(Core::Asid a){assert(owners[a.id]->refs);owners[a.id]->registered=false;}void Free(DAddr,size_t){}};
 struct SystemType {int Kernel(){return 0;}};
+namespace Devices {struct Nx2GpuMemoryRegistry {std::vector<size_t> forgotten;static Nx2GpuMemoryRegistry& Get(){static Nx2GpuMemoryRegistry r;return r;}void ForgetDeviceRanges(size_t asid){forgotten.push_back(asid);}};}
 struct Host {Smmu smmu;SystemType sys;Smmu& MemoryManager(){return smmu;}SystemType& System(){return sys;}};
 struct Impl {std::mutex session_guard;std::deque<Session> sessions;std::deque<size_t> id_pool;size_t new_ids=0;Host host1x;struct File{Impl*p;void UnmapAllHandles(SessionId id){assert(p->sessions[id.id].process->refs>0);assert(p->sessions[id.id].process->memory==7);}} file{this};};
 struct Container {Impl storage;Impl*impl=&storage;SessionId OpenSession(Kernel::KProcess*);void CloseSession(SessionId);};
@@ -34,6 +35,9 @@ int main(){
  auto d=c.OpenSession(&q);assert(d.id==a.id && q.refs==2);
  c.impl->sessions[d.id].mapper=std::make_unique<Mapper>();c.impl->sessions[d.id].has_preallocated_area=true;
  c.CloseSession(d);assert(q.refs==1 && !q.registered);q.Close(0);
+ // Only each session's final close forgets its device ranges (in the registry).
+ const auto& forgotten=Devices::Nx2GpuMemoryRegistry::Get().forgotten;
+ assert(forgotten.size()==2 && forgotten[0]==0 && forgotten[1]==1);
 }
 '''
 with tempfile.TemporaryDirectory() as d:

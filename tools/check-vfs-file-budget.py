@@ -21,6 +21,7 @@ program = r'''
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -61,8 +62,9 @@ struct RealVfsFilesystem {
     std::mutex list_lock;
     size_t num_open_files = 0;
     bool in_dtor = false;
+    std::map<std::string, std::weak_ptr<void>, std::less<>> cache;
     std::unique_lock<std::mutex> RefreshReference(const std::string&, OpenMode, FileReference&);
-    void DropReference(std::unique_ptr<FileReference>&&);
+    void DropReference(std::unique_ptr<FileReference>&&, const std::string&);
     void EvictSingleReferenceLocked();
     void InsertReferenceIntoListLocked(FileReference&);
     void RemoveReferenceFromListLocked(FileReference&);
@@ -94,7 +96,7 @@ int main(int argc, char** argv) {
         auto lock = fs.RefreshReference(argv[1], FileSys::OpenMode::Read, *refs.front());
         assert(refs.front()->file && std::fgetc(refs.front()->file->handle) == 'X');
     }
-    for (auto& ref : refs) { fs.DropReference(std::move(ref)); ref.reset(); }
+    for (auto& ref : refs) { fs.DropReference(std::move(ref), argv[1]); ref.reset(); }
     assert(live_files == 0 && fs.num_open_files == 0);
     for (auto file : reserved) std::fclose(file);
 }
