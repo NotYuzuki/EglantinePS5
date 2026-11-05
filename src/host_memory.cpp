@@ -540,13 +540,13 @@ void HostMemory::ClearBackingRegion(size_t offset, size_t length, u32 fill) {
     // A fill with zeroes leaves a slot that shows the zero block alone (memory_pages.cpp).
     if (length) ClearGuestMemory(backing_base + offset, offset, length, static_cast<int>(fill));
 }
-#ifdef EDEN_HOST_MEMORY_BACKING_MODE
 // PS5 clears unconditionally through its demand-backed guest-memory service.
 // Upstream's skip-zero tracking is therefore unnecessary here.
 void HostMemory::MarkUsed(size_t, size_t) {}
 void HostMemory::MarkDirty(size_t, size_t) {}
 void HostMemory::ForgetContents() {}
-#endif
+// The console has no working set to trim: memory_pages.cpp backs guest pages on demand.
+void HostMemory::HintCold(size_t, size_t, std::optional<size_t>) const {}
 // Eden asks for these while a page table uses VirtualBasePointer() as its fastmem arena. Without a window (the
 // window is off on the console) there is no arena to change: the page table, which Eden has already updated, is what
 // serves the guest's memory, so the request has nothing left to do. It used to be an error; a Switch 2 program made

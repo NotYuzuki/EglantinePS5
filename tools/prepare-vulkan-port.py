@@ -10,6 +10,11 @@ port = Path(__file__).resolve().parents[1] / 'headless'
 broken = []
 def adapt(relative, destination, replacements):
     text = (source / relative).read_text()
+    if relative.endswith('/vk_query_cache.cpp'):
+        # The core traces each host conditional rendering decision; the port counts them itself
+        # (hcr counters below), so drop those calls and keep the port's anchors on the logic.
+        import re
+        text = re.sub(r'\n[ \t]*TraceConditionalRendering\([^;]*?\);(?=\n)', '', text)
     for old, new in replacements:
         if relative.endswith('/vk_rasterizer.cpp') and old.endswith('// update engine as channel may be different.') and old not in text:
             marker = '// Donkey Kong Bananza\'s terrain:'
@@ -62,8 +67,9 @@ constexpr VkPipelineStageFlags COMPUTE_CONSUMER_STAGES =
 } // namespace
 
 void RasterizerVulkan::DispatchCompute() {"""),
-    ('        scheduler.RequestOutsideRenderPassOperationContext();\n        scheduler.Record([pipeline, indirect_buffer = buffer->Handle(),',
+    ('        scheduler.RequestOutsideRenderPassOperationContext();\n        scheduler.TraceComputePipeline(pipeline->ShaderHash());\n        scheduler.Record([this, pipeline, indirect_buffer = buffer->Handle(),',
      """        scheduler.RequestOutsideRenderPassOperationContext();
+        scheduler.TraceComputePipeline(pipeline->ShaderHash());
         if (::Eden::DevVulkan::compute_barriers) {
             scheduler.Record([](vk::CommandBuffer cmdbuf) {
                 cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
@@ -71,15 +77,16 @@ void RasterizerVulkan::DispatchCompute() {"""),
                                        0, COMPUTE_INPUT_BARRIER);
             });
         }
-        scheduler.Record([pipeline, indirect_buffer = buffer->Handle(),"""),
-    ('            cmdbuf.DispatchIndirect(indirect_buffer, indirect_offset);\n',
-     """            cmdbuf.DispatchIndirect(indirect_buffer, indirect_offset);
+        scheduler.Record([this, pipeline, indirect_buffer = buffer->Handle(),"""),
+    ('                cmdbuf.DispatchIndirect(indirect_buffer, indirect_offset);\n            });\n',
+     """                cmdbuf.DispatchIndirect(indirect_buffer, indirect_offset);
+            });
             if (::Eden::DevVulkan::compute_barriers)
                 cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, COMPUTE_CONSUMER_STAGES, 0,
                                        COMPUTE_WRITE_BARRIER);
 """),
-    ('        cmdbuf.Dispatch(dim[0], dim[1], dim[2]);\n',
-     """        cmdbuf.Dispatch(dim[0], dim[1], dim[2]);
+    ('                               [&] { cmdbuf.Dispatch(dim[0], dim[1], dim[2]); });\n',
+     """                               [&] { cmdbuf.Dispatch(dim[0], dim[1], dim[2]); });
         if (::Eden::DevVulkan::compute_barriers)
             cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, COMPUTE_CONSUMER_STAGES, 0,
                                    COMPUTE_WRITE_BARRIER);
@@ -106,13 +113,12 @@ void RasterizerVulkan::DispatchCompute() {"""),
     ('        std::scoped_lock lock{texture_cache.mutex};\n        texture_cache.WriteMemory(addr, size);\n    }\n    pipeline_cache.InvalidateRegion(addr, size);',
      '        ::Eden::Performance::GuestCacheLock(texture_cache.mutex);\n'
      '        std::lock_guard lock{texture_cache.mutex, std::adopt_lock};\n        texture_cache.WriteMemory(addr, size);\n    }\n    pipeline_cache.InvalidateRegion(addr, size);'),
-    # The upstream code has an __ANDROID__ ifdef for DRAWS_TO_DISPATCH (512 vs 4096) and
-    # CHECK_MASK (3 vs 7). Neither branch applies: replace the whole block. 512 draws per
-    # command buffer submission: 4,096 exceeds the PS5 GPU watchdog timeout in shader-heavy
-    # scenes (VK_ERROR_DEVICE_LOST in Xenoblade 2's cities). CHECK_MASK is the configurable
-    # dispatch interval (dev-settings dispatch_draws=N); default 64 draws between hand-offs.
-    ('#ifdef __ANDROID__\n    static constexpr u32 DRAWS_TO_DISPATCH = 512;\n    static constexpr u32 CHECK_MASK = 3;\n#else\n    // Every 32 draws (was 8): each dispatch woke the worker thread, and Switch 2 titles make\n    // ~55,000 draws a second. A full chunk is dispatched on its own (Scheduler::Record).\n    static constexpr u32 DRAWS_TO_DISPATCH = 4096;\n    static constexpr u32 CHECK_MASK = 31;\n#endif // __ANDROID__\n\n    static_assert(DRAWS_TO_DISPATCH % (CHECK_MASK + 1) == 0);\n',
-     '    static constexpr u32 DRAWS_TO_DISPATCH = 512;\n    const u32 CHECK_MASK = ::Eden::Performance::dispatch_mask.load(std::memory_order_relaxed);\n\n'),
+    # 512 draws per command buffer submission for titles without native tiling (Switch 1):
+    # 4,096 exceeds the PS5 GPU watchdog timeout in shader-heavy scenes (VK_ERROR_DEVICE_LOST in
+    # Xenoblade 2's cities). Native (Switch 2) titles already submit every 128 draws
+    # (SubmissionPolicy::DefaultNativeBudget).
+    ('    u32 legacy_budget = 4096;\n', '    u32 legacy_budget = 512;\n'),
+    ('(device.IsMoltenVK() ? 128U : 4096U);', '(device.IsMoltenVK() ? 128U : 512U);'),
     # Where the ~4 us a draw spends goes: six phases under one running clock, each Mark taking the
     # gap since the previous one so they do not overlap. The Timer still wraps the whole function,
     # so a draw that returns early is charged for its unmarked tail and the sum of the six falls
@@ -142,36 +148,22 @@ void RasterizerVulkan::DispatchCompute() {"""),
     }()};
     ::Eden::Performance::Mark(::Eden::Performance::draw_pipeline, phase);
 '''),
-    ('''    pipeline->SetEngine(maxwell3d, gpu_memory);
-    if (Profile::Scope scope{Profile::Zone::Configure}; !pipeline->Configure(is_indexed)) {
-        report_failure("configure failed");
-        return;
-    }
-''',
-     '''    pipeline->SetEngine(maxwell3d, gpu_memory);
-    // Waiting for both cache mutexes. SetEngine between them and here is two pointer assignments,
-    // and the hold itself carries on through what follows: the phases below measure it.
-    ::Eden::Performance::Mark(::Eden::Performance::draw_lock_wait, phase);
-    if (Profile::Scope scope{Profile::Zone::Configure}; !pipeline->Configure(is_indexed)) {
-        report_failure("configure failed");
-        return;
-    }
-    ::Eden::Performance::Mark(::Eden::Performance::draw_config, phase);
-'''),
-    ('''    query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, maxwell3d->regs.zpass_pixel_count_enable);
-    {
-        Profile::Scope scope{Profile::Zone::DrawRecord};
-        draw_func();
-    }
-''',
-     '''    query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, maxwell3d->regs.zpass_pixel_count_enable);
-    ::Eden::Performance::Mark(::Eden::Performance::draw_state, phase);
-    {
-        Profile::Scope scope{Profile::Zone::DrawRecord};
-        draw_func();
-    }
-    ::Eden::Performance::Mark(::Eden::Performance::draw_record, phase);
-'''),
+    ('    pipeline->SetEngine(maxwell3d, gpu_memory);\n    const u32 repack_dirty',
+     '    pipeline->SetEngine(maxwell3d, gpu_memory);\n'
+     '    // Waiting for both cache mutexes. SetEngine between them and here is two pointer assignments,\n'
+     '    // and the hold itself carries on through what follows: the phases below measure it.\n'
+     '    ::Eden::Performance::Mark(::Eden::Performance::draw_lock_wait, phase);\n'
+     '    const u32 repack_dirty'),
+    ('        TraceRenderState(is_indexed, "configure-failed", nullptr);\n        return;\n    }\n',
+     '        TraceRenderState(is_indexed, "configure-failed", nullptr);\n        return;\n    }\n'
+     '    ::Eden::Performance::Mark(::Eden::Performance::draw_config, phase);\n'),
+    ('    query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, maxwell3d->regs.zpass_pixel_count_enable);\n'
+     '    {\n        Profile::Scope scope{Profile::Zone::DrawRecord};\n',
+     '    query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, maxwell3d->regs.zpass_pixel_count_enable);\n'
+     '    ::Eden::Performance::Mark(::Eden::Performance::draw_state, phase);\n'
+     '    {\n        Profile::Scope scope{Profile::Zone::DrawRecord};\n'),
+    ('        draw_func();\n    }\n    submitted = true;',
+     '        draw_func();\n    }\n    ::Eden::Performance::Mark(::Eden::Performance::draw_record, phase);\n    submitted = true;'),
     # A forced release blocks the GPU thread until the fence thread has retired
     # every older fence. Time only that producer-side drain.
     ('    fence_manager.WaitPendingFences(force);',
@@ -184,14 +176,14 @@ void RasterizerVulkan::DispatchCompute() {"""),
     # UpdateDynamicStates asked the cache for the current pipeline a second time
     # per draw, recomputing the same fixed-state key. Reuse PrepareDraw's result;
     # other callers keep the original lookup.
-    ('template <typename Func>\nvoid RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {',
+    ('template <typename Func>\nvoid RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_indirect) {',
      '''namespace {
 // GPU thread only: the pipeline PrepareDraw refreshed for the draw in progress.
 GraphicsPipeline* prepared_pipeline = nullptr;
 } // namespace
 
 template <typename Func>
-void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {'''),
+void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_indirect) {'''),
     ('    std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};\n    // update engine as channel may be different.',
      '''    std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
     prepared_pipeline = pipeline;
@@ -787,15 +779,15 @@ adapt('src/video_core/renderer_vulkan/vk_scheduler.cpp', 'vulkan_scheduler.cpp',
     ('        .pInheritanceInfo = nullptr,\n    });\n    current_upload_cmdbuf = vk::CommandBuffer(command_pool->Commit(), device.GetDispatchLoader());',
      '        .pInheritanceInfo = nullptr,\n    });\n    GpuTimeBegin(device, current_cmdbuf);\n'
      '    current_upload_cmdbuf = vk::CommandBuffer(command_pool->Commit(), device.GetDispatchLoader());'),
-    ('        upload_cmdbuf.End();\n        cmdbuf.End();\n',
-     '        upload_cmdbuf.End();\n        GpuTimeEnd(cmdbuf);\n        cmdbuf.End();\n'),
-    ('            vk::Check(result);\n            break;\n        }\n    });\n    chunk->MarkSubmit();',
-     '            vk::Check(result);\n            break;\n        }\n        GpuTimeCollect(device);\n    });\n    chunk->MarkSubmit();'),
+    ('        cmdbuf.End();\n\n        if (on_submit) {',
+     '        GpuTimeEnd(cmdbuf);\n        cmdbuf.End();\n\n        if (on_submit) {'),
+    ('            trace_frame_end = 0;\n        }\n    });\n    chunk->MarkSubmit();',
+     '            trace_frame_end = 0;\n        }\n        GpuTimeCollect(device);\n    });\n    chunk->MarkSubmit();'),
     ('    const u64 signal_value = SubmitExecution(signal_semaphore, wait_semaphore);\n'
-     '    AllocateNewContext();\n    return signal_value;',
+     '    AllocateNewContext();\n    last_flush = std::chrono::steady_clock::now();',
      '    const u64 signal_value = SubmitExecution(signal_semaphore, wait_semaphore);\n'
      '    if (::Eden::DevVulkan::sync_submissions) {\n        Wait(signal_value);\n    }\n'
-     '    AllocateNewContext();\n    return signal_value;'),
+     '    AllocateNewContext();\n    last_flush = std::chrono::steady_clock::now();'),
 ])
 adapt('src/video_core/renderer_vulkan/pipeline_helper.h',
       'include/video_core/renderer_vulkan/pipeline_helper.h', [
@@ -831,14 +823,14 @@ adapt('src/video_core/renderer_vulkan/renderer_vulkan.cpp', 'vulkan_renderer.cpp
     # A frame the display has no refresh for is not presented: a game patched for more frames
     # than the output shows keeps its pace instead of waiting for a refresh per frame
     # (headless/display_refresh.h). The frame still ends as any other.
-    ('    RenderScreenshot(framebuffers);\n    Frame* frame = present_manager.GetRenderFrame();',
+    ('    RenderScreenshot(framebuffers);\n    const auto acquiring',
      '    RenderScreenshot(framebuffers);\n'
      '    if (::Eden::Display::SkipFrame()) {\n'
      '        gpu.RendererFrameEndNotify();\n'
      '        rasterizer.TickFrame();\n'
      '        return;\n'
      '    }\n'
-     '    Frame* frame = present_manager.GetRenderFrame();'),
+     '    const auto acquiring'),
     ('    Report();', '    PresentLoading();\n    Report();'),
     ('swapchain.GetImageViewFormat());', 'swapchain.GetImageViewFormat(), true);'),
     ('layout, 1, format);', 'layout, 1, format, true);'),
@@ -847,9 +839,8 @@ adapt('src/video_core/renderer_vulkan/renderer_vulkan.cpp', 'vulkan_renderer.cpp
     # Present() only records the hand-off into a fresh chunk. Dispatch it now so
     # the present thread gets this frame immediately instead of after the
     # producer's next 8-draw dispatch (upstream does this only with LSFG).
-    ('    present_manager.Present(frame);\n#ifdef HAS_LSFG\n    scheduler.DispatchWork();\n#endif',
-     '    present_manager.Present(frame);\n    Eden::CountPresentedFrame();\n'
-     '    scheduler.DispatchWork();'),
+    ('#ifdef HAS_LSFG\n    scheduler.DispatchWork();\n#endif\n\n    gpu.RendererFrameEndNotify();',
+     '    Eden::CountPresentedFrame();\n    scheduler.DispatchWork();\n\n    gpu.RendererFrameEndNotify();'),
     ('} // namespace Vulkan', '''} // namespace Vulkan
 namespace Eden {
 void PresentVulkanLoading(VideoCore::RendererBase& renderer) {
@@ -954,7 +945,8 @@ gc_setup = '''    const auto ReclaimedBytes = [&](const Image& image) {
     };
 ''' + (port / 'vulkan_gc_downloads.inc').read_text()
 for old, new in [
-    ('    const auto Cleanup = [this, &num_iterations, &high_priority_mode, &aggressive_mode]',
+    ('    const auto Cleanup = [this, &num_iterations, &high_priority_mode, &aggressive_mode,\n'
+     '                          &evict_old_costly]',
      gc_setup + '\n    const auto Cleanup = [&, this]'),
     ('        if (must_download) {', '        if (must_download && !TakePrefetched(image_id, image)) {'),
     # Time the per-image drain Cleanup still takes for an image the prefetch could not batch.
@@ -1127,14 +1119,43 @@ for name in ('vk_graphics_pipeline', 'vk_compute_pipeline'):
     ]
     if name == 'vk_graphics_pipeline':
         anchors += configure_phases
+    else:
+        # A compute pipeline the driver takes over a second to build is written to stderr (with its
+        # hash, as named in logs/native-shaders); EDEN_COMPUTE_BUILD_TRACE=1 also writes each start,
+        # so a build that never ends shows as a start with no end.
+        anchors.append(('#include <algorithm>\n#include "performance.h"',
+                        '#include <algorithm>\n#include <chrono>\n#include <cstdio>\n#include <cstdlib>\n'
+                        '#include "performance.h"'))
+        anchors.append((
+            '            pipeline = device.GetLogical().CreateComputePipeline(compute_ci, *pipeline_cache);\n',
+            '            static const bool trace_builds = [] {\n'
+            '                const char* value = std::getenv("EDEN_COMPUTE_BUILD_TRACE");\n'
+            '                return value != nullptr && value[0] == \'1\';\n'
+            '            }();\n'
+            '            if (trace_builds) {\n'
+            '                std::fprintf(stderr, "EDEN_COMPUTE_BUILD start %016llx\\n",\n'
+            '                             static_cast<unsigned long long>(shader_hash));\n'
+            '                std::fflush(stderr);\n'
+            '            }\n'
+            '            const auto build_start = std::chrono::steady_clock::now();\n'
+            '            pipeline = device.GetLogical().CreateComputePipeline(compute_ci, *pipeline_cache);\n'
+            '            const auto build_ms = std::chrono::duration_cast<std::chrono::milliseconds>(\n'
+            '                std::chrono::steady_clock::now() - build_start).count();\n'
+            '            if (trace_builds || build_ms >= 1000) {\n'
+            '                std::fprintf(stderr, "EDEN_COMPUTE_BUILD done %016llx %lld ms\\n",\n'
+            '                             static_cast<unsigned long long>(shader_hash),\n'
+            '                             static_cast<long long>(build_ms));\n'
+            '                std::fflush(stderr);\n'
+            '            }\n'))
     adapt(f'src/video_core/renderer_vulkan/{name}.cpp', name + '_cost.cpp', anchors)
 shader_costs = [
     ('#include <algorithm>', '#include <algorithm>\n#include <cstdio>\n#include <unordered_set>\n'
      '#include "performance.h"\n#include "dev_vulkan.h"\n#include "diagnostics.h"'),
     # Development crash probes: report each pipeline's first use (stage hashes) to klog,
     # which survives a GPU fault that kills the title.
-    ('    current_pipeline = pipeline.get();\n    return BuiltPipeline(current_pipeline);\n}',
-     '    current_pipeline = pipeline.get();\n'
+    ('    current_pipeline = pipeline.get();\n    current_pipeline->MarkUsed(frame_count);\n'
+     '    return BuiltPipeline(current_pipeline);\n}',
+     '    current_pipeline = pipeline.get();\n    current_pipeline->MarkUsed(frame_count);\n'
      '    if (::Eden::DevVulkan::trace_pipelines) {\n'
      '        static std::unordered_set<const void*> traced;\n'
      '        if (traced.insert(current_pipeline).second) {\n'
@@ -1149,42 +1170,39 @@ shader_costs = [
      '        }\n'
      '    }\n'
      '    return BuiltPipeline(current_pipeline);\n}'),
-    ('    if (!is_new) {\n        return pipeline.get();\n    }\n'
-     '    try {\n        pipeline = CreateComputePipeline(key, shader);\n'
-     '    } catch (const Shader::TensorRejected&) {\n        compute_cache.erase(pair);\n'
-     '        rejected_tensor_pipelines.emplace(key, std::current_exception());\n        throw;\n    }\n'
-     '    return pipeline.get();\n}',
-     '    if (is_new) {\n'
-     '        try {\n            pipeline = CreateComputePipeline(key, shader);\n'
-     '        } catch (const Shader::TensorRejected&) {\n            compute_cache.erase(pair);\n'
-     '            rejected_tensor_pipelines.emplace(key, std::current_exception());\n            throw;\n        }\n'
-     '    }\n'
+    ('    if (is_new) {\n        entry = CreateComputePipeline(key, shader);\n    }\n'
+     '    return entry.Get(kepler_compute->IsNativeMode(),\n'
+     '                     kepler_compute->regs.code_loc.Address() + qmd.program_start, key);\n}',
+     '    if (is_new) {\n        entry = CreateComputePipeline(key, shader);\n    }\n'
+     '    ComputePipeline* const pipeline = entry.Get(kepler_compute->IsNativeMode(),\n'
+     '        kepler_compute->regs.code_loc.Address() + qmd.program_start, key);\n'
      '    if (::Eden::DevVulkan::trace_pipelines && pipeline) {\n'
      '        static std::unordered_set<const void*> traced;\n'
-     '        if (traced.insert(pipeline.get()).second) {\n'
+     '        if (traced.insert(pipeline).second) {\n'
      '            char text[160];\n'
      '            std::snprintf(text, sizeof(text), "C%zu p=%p new=%d cs=%llx shared=%u wg=%u,%u,%u", traced.size(),\n'
-     '                          (const void*)pipeline.get(), int(is_new), (unsigned long long)key.unique_hash, unsigned(key.shared_memory_size),\n'
+     '                          (const void*)pipeline, int(is_new), (unsigned long long)key.unique_hash, unsigned(key.shared_memory_size),\n'
      '                          unsigned(key.workgroup_size[0]), unsigned(key.workgroup_size[1]),\n'
      '                          unsigned(key.workgroup_size[2]));\n'
      '            ::Eden::Report("pipeline", text);\n'
      '            LOG_INFO(Render_Vulkan, "EDEN_PIPELINE_FIRST_USE {}", text);\n'
      '        }\n'
      '    }\n'
-     '    return pipeline.get();\n}'),
+     '    return pipeline;\n}'),
     ('std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {',
      'std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {\n    auto timer = Eden::Performance::VulkanTimer(17);'),
     ('    const ComputePipelineCacheKey& key, const ShaderInfo* shader) {',
      '    const ComputePipelineCacheKey& key, const ShaderInfo* shader) {\n    auto timer = Eden::Performance::VulkanTimer(17);'),
     ('                                                 u32 cache_version) try {',
      '                                                 u32 cache_version) try {\n    auto timer = Eden::Performance::VulkanTimer(18);'),
-    ('}\n\nPipelineCache::~PipelineCache()',
+    ('        device.SupportsTransformFeedbackProvokingVertexPreservation();\n}\n',
+     '        device.SupportsTransformFeedbackProvokingVertexPreservation();\n'
      '    if (Eden::Performance::vulkan_cost_enabled.load(std::memory_order_relaxed))\n'
      '        std::printf("EDEN_VULKAN_DYNAMIC blend=%u enables=%u vertex=%u\\n",\n'
      '                    unsigned(dynamic_features.has_extended_dynamic_state_3_blend),\n'
      '                    unsigned(dynamic_features.has_extended_dynamic_state_3_enables),\n'
      '                    unsigned(dynamic_features.has_dynamic_vertex_input));\n'
-     '}\n\nPipelineCache::~PipelineCache()'),
+     '}\n'),
 ]
 # Time both graphics and compute preparation, without modifying the compiler or
 # reading guest state on another thread. These intervals overlap shader_prepare.
@@ -1213,6 +1231,21 @@ for statement in (
     shader_source = shader_source.replace(statement,
         'auto cfg_cost = Eden::Performance::VulkanTimer(20);\n        ' + statement +
         '\n        cfg_cost.reset();')
+# EDEN_COMPUTE_SPIRV_DUMP=<dir>: each compute shader's SPIR-V, written as <hash>.spv before the
+# driver builds it, so a build that never ends (EDEN_COMPUTE_BUILD start with no done) can be
+# compiled off the console.
+shader_costs.append((
+    '    // Text log + .spv dump. Same split as the graphics path.',
+    '    if (static const char* const spirv_dir = std::getenv("EDEN_COMPUTE_SPIRV_DUMP"); spirv_dir) {\n'
+    '        char spirv_path[512];\n'
+    '        std::snprintf(spirv_path, sizeof(spirv_path), "%s/%016llx.spv", spirv_dir,\n'
+    '                      static_cast<unsigned long long>(key.unique_hash));\n'
+    '        if (std::FILE* spirv_file = std::fopen(spirv_path, "wb")) {\n'
+    '            std::fwrite(code.data(), sizeof(u32), code.size(), spirv_file);\n'
+    '            std::fclose(spirv_file);\n'
+    '        }\n'
+    '    }\n'
+    '    // Text log + .spv dump. Same split as the graphics path.'))
 for old, new in shader_costs:
     if shader_source.count(old) != 1:
         raise RuntimeError(f'Shader pipeline anchor changed: {old[:60]}')
@@ -1287,7 +1320,7 @@ probes = {
     ],
 }
 for name, index, expected in (
-    ('vk_fence_manager', 6, 1), ('vk_buffer_cache', 7, 3),
+    ('vk_fence_manager', 6, 1), ('vk_buffer_cache', 7, 4),
     ('vk_texture_cache', 8, 2), ('vk_swapchain', 9, 6),
     ('vk_descriptor_buffer', 10, 2), ('vk_multi_range_buffer', 11, 1),
     ('vk_compute_pass', 12, 1),

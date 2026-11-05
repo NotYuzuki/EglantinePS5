@@ -137,11 +137,10 @@ string(REPLACE "    // \"from\" might no longer be valid if the thread was kille
 # switched to (rewind_stack is only set up), 4 MiB for each of a Switch 2 game's ~170 threads, 690 MiB
 # of the 12 GiB the console shares (Mario Kart World, 2026-11-01). 1 MiB to run on (Eden's OpenOrbis
 # build gives 512 KiB) and 64 KiB for the other.
+# (The core no longer keeps a second, rewind stack per fiber, and leaves stacks uninitialized.)
 string(REPLACE "constexpr size_t DEFAULT_STACK_SIZE = 512 * 4096;"
-    "constexpr size_t DEFAULT_STACK_SIZE = 256 * 4096;\nconstexpr size_t REWIND_STACK_SIZE = 16 * 4096;" fiber_source "${fiber_source}")
-string(REPLACE "    std::array<u8, DEFAULT_STACK_SIZE> rewind_stack{};"
-    "    std::array<u8, REWIND_STACK_SIZE> rewind_stack{};" fiber_source "${fiber_source}")
-string(FIND "${fiber_source}" "REWIND_STACK_SIZE> rewind_stack" fiber_rewind_found)
+    "constexpr size_t DEFAULT_STACK_SIZE = 256 * 4096;" fiber_source "${fiber_source}")
+string(FIND "${fiber_source}" "DEFAULT_STACK_SIZE = 256 * 4096;" fiber_rewind_found)
 if(fiber_rewind_found EQUAL -1)
     message(FATAL_ERROR "fiber.cpp stack anchors changed")
 endif()
@@ -181,6 +180,9 @@ include("${EDEN_PORT_DIR}/jit-alias.cmake")
         "        , EdenJitAllocator())\n    , constant_pool" code_source "${code_source}")
     string(REPLACE "        , nullptr)\n#endif\n    , constant_pool"
         "        , EdenJitAllocator())\n#endif\n    , constant_pool" code_source "${code_source}")
+    # The core's CodeAllocator() reserves and commits on Windows only; elsewhere it is nullptr.
+    string(REPLACE "        , CodeAllocator())\n    , constant_pool"
+        "        , EdenJitAllocator())\n    , constant_pool" code_source "${code_source}")
     string(FIND "${code_source}" ", EdenJitAllocator())" port_jit_allocator)
     if(port_jit_allocator LESS 0)
         message(FATAL_ERROR "JIT allocator adapter did not apply")
@@ -1224,18 +1226,6 @@ list(REMOVE_ITEM core_sources core.cpp)
 list(APPEND core_sources "${PORT_BUILD_DIR}/core.cpp")
 set_property(TARGET core PROPERTY SOURCES "${core_sources}")
 
-# The builder's vectors own every context through serialization. Parent links
-# only navigate that live tree; owning them creates parent/child cycles.
-file(READ "${PROJECT_SOURCE_DIR}/src/core/file_sys/fsmitm_romfsbuild.cpp" romfs_source)
-string(REPLACE "    std::shared_ptr<RomFSBuildDirectoryContext> parent;"
-    "    RomFSBuildDirectoryContext* parent = nullptr;" romfs_source "${romfs_source}")
-string(REPLACE "parent = std::move(parent_dir_ctx);" "parent = parent_dir_ctx.get();" romfs_source "${romfs_source}")
-write_derived("${PORT_BUILD_DIR}/fsmitm_romfsbuild.cpp" "${romfs_source}")
-get_target_property(core_sources core SOURCES)
-list(REMOVE_ITEM core_sources file_sys/fsmitm_romfsbuild.cpp)
-list(APPEND core_sources "${PORT_BUILD_DIR}/fsmitm_romfsbuild.cpp")
-set_property(TARGET core PROPERTY SOURCES "${core_sources}")
-
 # One change to a pinned Eden source; the build stops when the text it replaces is gone.
 function(eden_patch source old new)
     string(FIND "${${source}}" "${old}" patch_at)
@@ -1562,8 +1552,8 @@ if(EDEN_DEV_PROFILE)
     # the service process that ran it.
     string(PREPEND kernel_source "#include <algorithm>\n#include <chrono>\n#include <cstdio>\n#include <string>\n")
     string(REPLACE "    bool services_closing = false;" "    bool services_closing = false;\n    std::vector<std::string> server_names;" kernel_source "${kernel_source}")
-    string(REPLACE "            impl->server_managers.emplace_back(std::move(server_manager));\n        }"
-        "            impl->server_managers.emplace_back(std::move(server_manager));\n            auto* eden_process = GetCurrentProcessPointer(*this);\n            impl->server_names.emplace_back(eden_process ? eden_process->GetName() : \"?\");\n        }" kernel_source "${kernel_source}")
+    string(REPLACE "        impl->server_managers.emplace_back(std::move(server_manager));\n    }"
+        "        impl->server_managers.emplace_back(std::move(server_manager));\n        auto* eden_process = GetCurrentProcessPointer(*this);\n        impl->server_names.emplace_back(eden_process ? eden_process->GetName() : \"?\");\n    }" kernel_source "${kernel_source}")
     string(REPLACE [=[        decltype(server_managers) closing_managers;
         {
             std::scoped_lock lk{server_lock};
@@ -1985,8 +1975,8 @@ write_derived("${PORT_BUILD_DIR}/sink_details.cpp" "#include \"devices.h\"\n${si
 file(READ "${PROJECT_SOURCE_DIR}/src/audio_core/sink/sink_stream.cpp" stream_source)
 string(REPLACE "    if (type == StreamType::In)\n        return;"
     "    if (type == StreamType::In)\n        return;\n    static_assert(std::is_same_v<decltype(samples_buffer), Common::RingBuffer<s16, 0x10000>>);\n    if (buffer.frames * device_channels > 0x10000 - samples_buffer.Size())\n        throw std::overflow_error(\"Audio PCM queue capacity exceeded\");" stream_source "${stream_source}")
-string(REPLACE "        samples_buffer.Push(new_samples);"
-    "        if (system_channels == 1 && device_channels == 2) {\n            for (std::size_t i = 0; i < new_samples.size(); i += 2) new_samples[i + 1] = new_samples[i];\n        }\n        samples_buffer.Push(new_samples);" stream_source "${stream_source}")
+string(REPLACE "        pushed = samples_buffer.Push(new_samples);"
+    "        if (system_channels == 1 && device_channels == 2) {\n            for (std::size_t i = 0; i < new_samples.size(); i += 2) new_samples[i + 1] = new_samples[i];\n        }\n        pushed = samples_buffer.Push(new_samples);" stream_source "${stream_source}")
 # Refresh the held frame before a partial hardware block underruns.
 string(REPLACE "    std::memcpy(last_frame.data(), &output_buffer[(frames_written - 1) * frame_size], frame_size_bytes);" "" stream_source "${stream_source}")
 string(REPLACE "        samples_buffer.Pop(&output_buffer[frames_written * frame_size], frames_available * frame_size);"
@@ -2223,7 +2213,9 @@ if(EDEN_PS5_OPENGL)
     string(PREPEND gpu_source "#include <glad/glad.h>\n")
     write_derived("${PORT_BUILD_DIR}/include/video_core/gpu_thread.h" "${gpu_thread_header}")
     target_include_directories(video_core BEFORE PRIVATE "${PORT_BUILD_DIR}/include")
-    string(REPLACE "    ~Impl() = default;" "    ~Impl() { gpu_thread.Stop(); if (renderer && Settings::IsOpenGL()) { renderer->Context().MakeCurrent(); glFinish(); } }" gpu_source "${gpu_source}")
+    # The core's ~Impl stops the worker through NotifyShutdown (below); OpenGL also drains its queue.
+    string(REPLACE "    ~Impl() {\n        NotifyShutdown();\n"
+        "    ~Impl() {\n        NotifyShutdown();\n        if (renderer && Settings::IsOpenGL()) {\n            renderer->Context().MakeCurrent();\n            glFinish();\n        }\n" gpu_source "${gpu_source}")
     # Join before unique_ptr destruction clears GPU::impl: queued draws call back
     # through GPU::TickWork. NotifyShutdown also protects service-owned state.
     # Eden joins its worker first; here the waiters are woken first, so that a guest thread waiting
@@ -2272,7 +2264,7 @@ if(EDEN_DEV_PROFILE)
     # render conditions apart from the game's own LOD choices (LOD swaps).
     file(READ "${PROJECT_SOURCE_DIR}/src/video_core/engines/maxwell_3d.cpp" maxwell_source)
     set(condition_accelerated "    if (rasterizer->AccelerateConditionalRendering()) {\n        execute_on = true;\n        return;\n    }")
-    set(condition_end "    }\n    }\n}\n\nvoid Maxwell3D::ProcessCounterReset() {")
+    set(condition_end "cmp.current_sequence, cmp.current_mode);\n    }\n}\n\nvoid Maxwell3D::ProcessCounterReset() {")
     foreach(anchor IN ITEMS condition_accelerated condition_end)
         string(FIND "${maxwell_source}" "${${anchor}}" anchor_at)
         if(anchor_at LESS 0)
@@ -2283,7 +2275,7 @@ if(EDEN_DEV_PROFILE)
         "    if (rasterizer->AccelerateConditionalRendering()) {\n        execute_on = true;\n        ::Eden::Performance::CountCondition(0);\n        return;\n    }"
         maxwell_source "${maxwell_source}")
     string(REPLACE "${condition_end}"
-        "    }\n    }\n    ::Eden::Performance::CountCondition(\n        regs.render_enable_override == Regs::RenderEnable::Override::AlwaysRender ? 1u :\n        regs.render_enable_override == Regs::RenderEnable::Override::NeverRender ? 2u :\n        3u + static_cast<unsigned>(regs.render_enable.mode) * 2u + (execute_on ? 1u : 0u));\n}\n\nvoid Maxwell3D::ProcessCounterReset() {"
+        "cmp.current_sequence, cmp.current_mode);\n    }\n    ::Eden::Performance::CountCondition(\n        regs.render_enable_override == Regs::RenderEnable::Override::AlwaysRender ? 1u :\n        regs.render_enable_override == Regs::RenderEnable::Override::NeverRender ? 2u :\n        3u + static_cast<unsigned>(regs.render_enable.mode) * 2u + (execute_on ? 1u : 0u));\n}\n\nvoid Maxwell3D::ProcessCounterReset() {"
         maxwell_source "${maxwell_source}")
     write_derived("${PORT_BUILD_DIR}/maxwell_3d.cpp" "#include \"${EDEN_PORT_DIR}/performance.h\"\n${maxwell_source}")
     list(REMOVE_ITEM video_sources engines/maxwell_3d.cpp)
@@ -2340,7 +2332,8 @@ ${paths_source}")
     string(REPLACE "${old_tsc_fallback}" "        }" features_source "${features_source}")
     # Eglantine measures the TSC of CPUs without leaf 0x15 itself, for frequency 0 only; the block
     # below covers every frequency under 1 GHz, so that one goes (tools/check-tsc-fallback.py).
-    string(REPLACE "    // AMD CPUs have no leaf 0x15 (Zen 4 stops at 0x10): measure their invariant TSC too, or every\n    // guest clock read (CNTPCT, which games read thousands of times a frame) goes through the\n    // host's much slower QueryPerformanceCounter.\n    if (caps.invariant_tsc && caps.tsc_frequency == 0) {\n        caps.tsc_frequency = X64::EstimateRDTSCFrequency();\n    }\n\n" "" features_source "${features_source}")
+    string(REPLACE "    // AMD CPUs have no leaf 0x15 (Zen 4 stops at 0x10): measure their invariant TSC too, or every\n    // guest clock read (CNTPCT, which games read thousands of times a frame) goes through the\n    // host's much slower QueryPerformanceCounter. Intel CPUs that have the leaf but report no\n    // crystal frequency (e.g. Coffee Lake) keep the OS clock: an i5-9400F crashed at launch on the\n    // measured RDTSC clock.\n    if (max_std_fn < 0x15 && caps.invariant_tsc && caps.tsc_frequency == 0) {\n        caps.tsc_frequency = X64::EstimateRDTSCFrequency();\n    }\n\n" ""
+        features_source "${features_source}")
     string(REPLACE "    if (max_std_fn >= 0x16) {"
         "    if (caps.invariant_tsc && caps.tsc_frequency < 1'000'000'000ULL) {\n        caps.tsc_frequency = X64::EstimateRDTSCFrequency();\n    }\n\n    if (max_std_fn >= 0x16) {" features_source "${features_source}")
     write_derived("${PORT_BUILD_DIR}/cpu_features.cpp" "${features_source}")
