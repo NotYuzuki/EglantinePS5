@@ -231,3 +231,17 @@ enabled for that run. Those diagnostics are optional; changes take effect
 after restarting the application. This is a checkpoint with the owner's movie
 validation complete and the final playable-scene check pending, not a claim
 that the later texture assertions are fixed.
+
+
+## Wrapper PR merge resolution
+
+Wrapper PR #23 resolves the divergent submodule pointers by selecting
+`25b75c6786d4e943158afa1747af6edea6e5637e`, the existing core PR #1 merge
+commit. It contains both the spatial checkpoint (`0c419316e9`) and the base's
+debug aids (`98c40ec84e`). The base handoff document is retained.
+No manual edits were made to the protected mesh/HMMA source files during this
+resolution. The console validation above applies to the earlier installed
+checkpoint; this combined core revision has not yet been console-tested.
+
+Combined-revision checks: PS5 build/package inventory, alignment and imports PASS;
+worker affinity checks and git diff checks PASS.
