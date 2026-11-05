@@ -55,6 +55,10 @@ def check():
     assert param['titleId'] == 'PPSA98515' and param['contentId'].endswith('EGLANTINEPS50001')
     assert param['localizedParameters']['en-US']['titleName'] == 'EglantinePS5'
     assert param['pubtools']['loudnessSnd0'] == '-28.00'
+    # PS5 Pro memory mode (attribute3 bit 22) and a 320 MiB flexible pool: both give the direct pool,
+    # which games run out of, more memory (tools/package-headless-native.sh).
+    assert int(param['attribute3']) & 0x400000
+    assert param['kernel']['flexibleMemorySize'] == 320 << 20
     lapy = json.loads((APP / 'lapy-manifest.json').read_text())
     assert lapy['schema'] == 'lapy-owned-build/1'
     assert lapy['target_title'] == 'PPSA98515' and lapy['mode'] == 'elf-helper'

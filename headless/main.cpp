@@ -64,6 +64,7 @@
 #include "eglantineps5/version.h"
 extern "C" void ps5_opengl_heap_snapshot(const char*, unsigned);
 extern "C" std::int64_t sceKernelGetDirectMemorySize();
+extern "C" std::int32_t sceKernelAvailableFlexibleMemorySize(std::size_t*);
 #else
 #include <malloc.h>
 #include "mock_devices.h"
@@ -752,6 +753,23 @@ int main(int argc, char** argv) {
         }
         Common::Log::Start();
         SCOPE_EXIT { Common::Log::Stop(); };
+#ifdef PS5_NATIVE
+        {
+            // The pool the guest's memory, the JIT, the heap and the Vulkan heaps share. A PS5 Pro
+            // gives 13,504 MiB to a title with attribute3 bit 22 (sce_sys/param.json) and 12,288 MiB
+            // without it. The flexible pool (the program, the system's libraries, anonymous mappings)
+            // is 320 MiB by kernel.flexibleMemorySize instead of 448, and what it is smaller by the
+            // direct pool is larger by: so a Pro is told by more than 13 GiB, which a base console
+            // never reaches.
+            const std::int64_t pool = sceKernelGetDirectMemorySize();
+            const bool pro = pool > (std::int64_t{13} << 30);
+            std::size_t flexible = 0;
+            const bool flexible_known = sceKernelAvailableFlexibleMemorySize(&flexible) == 0;
+            Eden::Report("memory", ("direct memory pool " + std::to_string(pool >> 20) + " MiB, PS5 Pro memory mode " +
+                                    (pro ? "active" : "inactive") + ", flexible memory free " +
+                                    (flexible_known ? std::to_string(flexible >> 20) + " MiB" : "unknown")).c_str());
+        }
+#endif
         #ifdef EDEN_PS5_OPENGL
         Settings::values.renderer_backend = backend == Eden::GraphicsBackend::Vulkan ?
             Settings::RendererBackend::Vulkan : Settings::RendererBackend::OpenGL_GLSL;

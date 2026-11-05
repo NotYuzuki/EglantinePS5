@@ -431,6 +431,7 @@ extern "C" unsigned eden_guest_memory_wanted(void) __attribute__((weak));
 extern "C" void eden_guest_memory_reserve(std::size_t* held, std::size_t* target) __attribute__((weak));
 #ifdef PS5_NATIVE
 extern "C" std::int64_t sceKernelGetDirectMemorySize();
+extern "C" std::int32_t sceKernelAvailableFlexibleMemorySize(std::size_t*);
 extern "C" std::int32_t sceKernelAvailableDirectMemorySize(std::int64_t, std::int64_t, std::size_t, std::int64_t*,
                                                            std::size_t*);
 // The allocated region at or after an offset (flag 1: find the next one).
@@ -480,8 +481,13 @@ static void RefreshFreeMemory() {
         summary_ns.store(now, std::memory_order_relaxed);
         std::size_t guest_span = 0, guest_held = 0;
         ::Common::GuestMemoryUsage(&guest_span, &guest_held);
-        std::fprintf(stderr, "EDEN_MEMORY pool largest free block %zu MiB, short=%d; the guest's memory holds %zu MiB\n",
-                     largest >> 20, int(view.short_memory), guest_held >> 20);
+        // The flexible pool is 320 MiB (sce_sys/param.json kernel.flexibleMemorySize): what is left of it.
+        std::size_t flexible = 0;
+        const bool flexible_known = sceKernelAvailableFlexibleMemorySize(&flexible) == 0;
+        std::fprintf(stderr, "EDEN_MEMORY pool largest free block %zu MiB, short=%d; the guest's memory holds %zu MiB; "
+                     "flexible memory free %lld MiB\n",
+                     largest >> 20, int(view.short_memory), guest_held >> 20,
+                     flexible_known ? static_cast<long long>(flexible >> 20) : -1LL);
         ReportHeap("every 20 s");
         ReportMappings("every 20 s", false);
     }
