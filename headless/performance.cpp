@@ -278,10 +278,19 @@ void CheckWorkerTopology() {
 void PlaceSecondary(const char* name) {
     const auto secondary = secondary_cpus.load(std::memory_order_relaxed);
     if (!placement_secondary.load(std::memory_order_relaxed) || !secondary) return;
-    const cpuset_t mask = CpuSet(secondary);
+    // dav1d chooses its parallelism from the decode worker's inherited CPU mask.
+    // A/B switch for 1080p60 AV1 sections that exceed the frame budget on secondary cores.
+    static const bool video_all_cores = [] {
+        const char* value = std::getenv("EDEN_NX2_VDEC_ALL_CORES");
+        return value && value[0] == '1';
+    }();
+    const bool video = std::strcmp(name, "nx2:vdec") == 0;
+    const bool unrestricted_video = video && video_all_cores && topology_allowed_valid;
+    const cpuset_t mask = unrestricted_video ? topology_allowed : CpuSet(secondary);
     const int result = cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1, 8, &mask);
-    if (secondary_reports.fetch_add(1, std::memory_order_relaxed) < 64)
-        std::printf("EDEN_WORKER_PLACED name=%s mask=%llx error=%d\n", name, secondary, result ? errno : 0);
+    if (video || secondary_reports.fetch_add(1, std::memory_order_relaxed) < 64)
+        std::printf("EDEN_WORKER_PLACED name=%s mask=%llx video_all_cores=%d error=%d\n",
+                    name, CpuBits(mask), unrestricted_video, result ? errno : 0);
 }
 void PinWorker(unsigned index, cpuset_t& affinity) {
     // Guest cores 4 and 5 of a Switch 1 title stay idle on the CPU set they inherited.

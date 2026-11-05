@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Exercise actual native topology discovery/pinning with mocked kernel APIs."""
 from pathlib import Path
-import subprocess,tempfile
+import os,subprocess,tempfile
 root=Path(__file__).resolve().parents[1]
 s=(root/'headless/performance.cpp').read_text();a=s.index('std::array<int, names.size()> worker_cpus');body=s[a:s.index('\n#endif',a)]
 code=r'''
@@ -9,6 +9,7 @@ code=r'''
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <cstdlib>
 #include <cstdio>
 #include <cerrno>
 #include <stdexcept>
@@ -91,12 +92,23 @@ int main(){
  fail_mask=0;fail_restore=true;bool threw=false;
  try{CheckWorkerTopology();}catch(const std::runtime_error&){threw=true;}
  assert(threw);
+ // Video can opt into the process CPU set; ordinary secondary workers remain restricted.
+ fail_restore=false; process=current=0x1fff; CheckWorkerTopology();
+ placement_secondary=false; PlaceSecondary("nx2:vdec"); assert(current==process);
+ placement_secondary=true;
+ const char* video_option=std::getenv("EDEN_NX2_VDEC_ALL_CORES");
+ const bool video_all=video_option && video_option[0]=='1';
+ PlaceSecondary("nx2:vdec");
+ assert(current==(video_all ? process : secondary_switch1));
+ current=process; PlaceSecondary("TextureDecoder"); assert(current==secondary_switch1);
  return 0;
 }
 '''
 with tempfile.TemporaryDirectory() as tmp:
     exe=Path(tmp)/'affinity'
     subprocess.run(['c++','-std=c++20','-Wall','-Wextra','-Werror','-fsanitize=address,undefined','-x','c++','-','-o',str(exe)],input=code,text=True,check=True)
-    subprocess.run([str(exe)],check=True)
+    for enabled in ("0", "1"):
+        env=dict(os.environ, EDEN_NX2_VDEC_ALL_CORES=enabled)
+        subprocess.run([str(exe)],check=True,env=env)
 print('Worker topology: PASS physical sibling exclusion, OS/APIC permutations, process and narrow masks, '
-      'skipped CPUs, pair fallback, Switch 2 guest cores 4-5 and restoration failures')
+      'skipped CPUs, pair fallback, Switch 2 guest cores 4-5, restoration failures and opt-in video placement')

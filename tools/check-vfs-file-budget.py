@@ -56,15 +56,13 @@ int ModeFlagsToFileAccessMode(OpenMode) { return 0; }
 struct FileReference : Common::IntrusiveListBaseNode<FileReference> {
     std::shared_ptr<FS::IOFile> file;
 };
-struct VfsFile {};
 struct RealVfsFilesystem {
     using List = Common::IntrusiveListBaseTraits<FileReference>::ListType;
     List open_references, closed_references;
-    // The core's open-file cache by path, which DropReference forgets an expired path from.
-    std::map<std::string, std::weak_ptr<VfsFile>, std::less<>> cache;
     std::mutex list_lock;
     size_t num_open_files = 0;
     bool in_dtor = false;
+    std::map<std::string, std::weak_ptr<void>, std::less<>> cache;
     std::unique_lock<std::mutex> RefreshReference(const std::string&, OpenMode, FileReference&);
     void DropReference(std::unique_ptr<FileReference>&&, const std::string&);
     void EvictSingleReferenceLocked();
