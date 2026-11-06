@@ -1,0 +1,205 @@
+From bae1e808d2be0d33ce83de89fb5abb91c598f5b5 Mon Sep 17 00:00:00 2001
+From: exploitizm <351399878+exploitizm@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 19:36:14 +1000
+Subject: [PATCH] radv/ps5: mesh experiment 0x4000000, every mesh wave's
+ exports captured to a file
+
+Runs 19:17 and 19:33: with positions all (0,0,0,1) and the real primitives
+the hang stays at the second chunk; with every primitive null and the real
+positions the GPU gets past it to the 102nd workgroup. So the primitive
+exports are the lever. 0x4000000 has every mesh wave take a 1 KiB slot (a
+ticket at the counters) below the counters and write its header (subgroup,
+workgroup index, launch vertex, its primitive and vertex counts), its lanes'
+primitive export arguments and their positions; the stall dump writes them
+to /data/eglantineps5/logs/mesh-exports.bin.
+---
+ src/amd/common/nir/ac_nir_lower_ngg_mesh.c  | 65 ++++++++++++++++++++-
+ src/amd/vulkan/radv_cmd_buffer.c            |  4 +-
+ src/amd/vulkan/radv_physical_device.c       |  2 +-
+ src/amd/vulkan/winsys/ps5/radv_ps5_winsys.c | 17 ++++++
+ 4 files changed, 84 insertions(+), 4 deletions(-)
+
+diff --git a/src/amd/common/nir/ac_nir_lower_ngg_mesh.c b/src/amd/common/nir/ac_nir_lower_ngg_mesh.c
+index 58f80d1..da706cd 100644
+--- a/src/amd/common/nir/ac_nir_lower_ngg_mesh.c
++++ b/src/amd/common/nir/ac_nir_lower_ngg_mesh.c
+@@ -29,7 +29,8 @@
+  * every primitive null, 0x100000 rounds the registers' mesh workgroup up to
+  * whole waves (radv_shader_info.c), 0x400000 exports one constant parameter
+  * from a shader without any, 0x2000000 adds its record's first_workgroup to
+- * a workgroup's index. The RADV cache UUID takes the mask too. */
++ * a workgroup's index, 0x4000000 captures every wave's exports
++ * (ms_ps5_capture_base). The RADV cache UUID takes the mask too. */
+ unsigned
+ ac_ps5_mesh_experiments(void)
+ {
+@@ -62,6 +63,37 @@ ms_ps5_count(nir_builder *b, unsigned which, bool per_wave)
+    }
+    nir_pop_if(b, if_first);
+ }
++
++/* Experiment 0x4000000: a 1 KiB slot a wave, by a ticket taken at the counters'
++ * fourth dword, in the 48 MiB below them: a header (subgroup, workgroup index,
++ * launch vertex, primitive and vertex counts as this wave has them), then at
++ * 32 its lanes' primitive export arguments, then at 160 their positions. The
++ * stall dump writes them to a file. */
++#define MS_PS5_CAPTURE_BYTES (48u << 20)
++#define MS_PS5_CAPTURE_SLOT  1024u
++
++static nir_def *
++ms_ps5_capture_base(nir_builder *b)
++{
++   nir_def *ring = nir_load_ms_publish_ring_amd(b);
++   nir_def *ticket = NULL;
++   nir_if *if_first = nir_push_if(b, nir_elect(b, 1));
++   {
++      ticket = nir_global_atomic(b, 32, nir_iadd_imm(b, ring, 12), nir_imm_int(b, 1), .atomic_op = nir_atomic_op_iadd);
++   }
++   nir_pop_if(b, if_first);
++   ticket = nir_read_first_invocation(b, nir_if_phi(b, ticket, nir_undef(b, 1, 32)));
++   ticket = nir_umin(b, ticket, nir_imm_int(b, MS_PS5_CAPTURE_BYTES / MS_PS5_CAPTURE_SLOT - 1));
++   return nir_iadd(b, nir_iadd_imm(b, ring, -(int64_t)MS_PS5_CAPTURE_BYTES),
++                   nir_u2u64(b, nir_imul_imm(b, ticket, MS_PS5_CAPTURE_SLOT)));
++}
++
++static nir_def *
++ms_ps5_capture_lane(nir_builder *b, nir_def *capture, unsigned offset, unsigned stride)
++{
++   nir_def *lane = nir_load_subgroup_invocation(b);
++   return nir_iadd(b, capture, nir_u2u64(b, nir_iadd_imm(b, nir_imul_imm(b, lane, stride), offset)));
++}
+ #endif
+ 
+ #define SPECIAL_MS_OUT_MASK \
+@@ -177,6 +209,9 @@ typedef struct
+    /* ac_ps5_mesh_experiments 0x800: the workgroup's own primitive count,
+     * the primitives past it exported null. */
+    nir_variable *real_prm_var;
++   /* ac_ps5_mesh_experiments 0x4000000: where this wave writes what it exports
++    * (ms_ps5_capture_base), NULL otherwise. */
++   nir_def *ps5_capture;
+    /* True if the output vertex and primitive counts are workgroup-uniform. */
+    bool output_counts_workgroup_uniform;
+ 
+@@ -1086,6 +1121,14 @@ emit_ms_vertex(nir_builder *b, nir_def *index, nir_def *row, bool exports, bool
+    ms_emit_arrayed_outputs(b, index, per_vertex_outputs, s);
+ 
+ #ifdef RADV_PS5
++   if (exports && s->ps5_capture) {
++      nir_def *pos[4];
++      for (unsigned c = 0; c < 4; c++)
++         pos[c] = s->out.outputs[VARYING_SLOT_POS][c] && s->out.outputs[VARYING_SLOT_POS][c]->bit_size == 32
++                     ? s->out.outputs[VARYING_SLOT_POS][c]
++                     : nir_imm_int(b, 0x7fc0dead);
++      nir_build_store_global(b, nir_vec(b, pos, 4), ms_ps5_capture_lane(b, s->ps5_capture, 160, 16), .align_mul = 16);
++   }
+    if (exports && (ac_ps5_mesh_experiments() & 0x20000)) {
+       /* Every position (0, 0, 0, 1). */
+       for (unsigned c = 0; c < 4; c++) {
+@@ -1150,6 +1193,10 @@ emit_ms_primitive(nir_builder *b, nir_def *index, nir_def *row, bool exports, bo
+ 
+       nir_def *prim_exp_arg = prim_exp_arg_ch2 ?
+          nir_vec2(b, prim_exp_arg_ch1, prim_exp_arg_ch2) : prim_exp_arg_ch1;
++#ifdef RADV_PS5
++      if (s->ps5_capture)
++         nir_build_store_global(b, prim_exp_arg_ch1, ms_ps5_capture_lane(b, s->ps5_capture, 32, 4), .align_mul = 4);
++#endif
+ 
+       ac_nir_export_primitive(b, prim_exp_arg, row);
+    }
+@@ -1452,6 +1499,8 @@ emit_ms_finale(nir_builder *b, lower_ngg_ms_state *s)
+    const bool count = (ac_ps5_mesh_experiments() & 0x8000) && !s->publish;
+    if (count)
+       ms_ps5_count(b, 1, true);
++   if ((ac_ps5_mesh_experiments() & 0x4000000) && !s->publish && !s->prim_parts)
++      s->ps5_capture = ms_ps5_capture_base(b);
+ #endif
+ 
+    nir_barrier(b, .execution_scope=SCOPE_WORKGROUP, .memory_scope=SCOPE_WORKGROUP,
+@@ -1466,6 +1515,20 @@ emit_ms_finale(nir_builder *b, lower_ngg_ms_state *s)
+ 
+    set_ms_final_output_counts(b, s, &num_prm, &num_vtx);
+ 
++#ifdef RADV_PS5
++   if (s->ps5_capture) {
++      nir_if *if_first = nir_push_if(b, nir_elect(b, 1));
++      {
++         nir_def *wg = s->workgroup_index ? s->workgroup_index : nir_imm_int(b, -1);
++         nir_build_store_global(b, nir_vec4(b, nir_load_subgroup_id(b), wg, nir_load_vertex_id_zero_base(b), num_prm),
++                                s->ps5_capture, .align_mul = 16);
++         nir_build_store_global(b, nir_vec4(b, num_vtx, nir_imm_int(b, 0x6d657368), nir_imm_int(b, 0), nir_imm_int(b, 0)),
++                                nir_iadd_imm(b, s->ps5_capture, 16), .align_mul = 16);
++      }
++      nir_pop_if(b, if_first);
++   }
++#endif
++
+ #ifdef RADV_PS5
+    if ((ac_ps5_mesh_experiments() & 0x800) && !s->prim_parts) {
+       /* Every workgroup exports all it allocated: the most of both. */
+diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
+index ab3a65b..21037b5 100644
+--- a/src/amd/vulkan/radv_cmd_buffer.c
++++ b/src/amd/vulkan/radv_cmd_buffer.c
+@@ -15522,7 +15522,7 @@ radv_task_emu_begin(struct radv_cmd_buffer *cmd_buffer, struct radv_task_emu *em
+ #ifdef RADV_PS5
+    /* Experiment 0x8000: the counters start from zero, once per process. */
+    static uint32_t counters_cleared;
+-   if ((radv_ps5_task_emu_debug() & 0x8000) && p_atomic_cmpxchg(&counters_cleared, 0u, 1u) == 0u) {
++   if ((radv_ps5_task_emu_debug() & 0x4008000) && p_atomic_cmpxchg(&counters_cleared, 0u, 1u) == 0u) {
+       const uint32_t zero[4] = {0};
+       radeon_check_space(device->ws, cmd_buffer->cs->b, 16);
+       radv_cs_write_data(device, cmd_buffer->cs, V_371_MICRO_ENGINE, va + RADV_TASK_EMU_BYTES - 64, 4, zero, false);
+@@ -15658,7 +15658,7 @@ radv_task_emu_draw_chunk(struct radv_cmd_buffer *cmd_buffer, const struct radv_t
+    uint64_t publish_ring = radv_ms_publishes(&mesh_shader->info) ? radv_buffer_get_va(device->ms_publish_ring) : 0;
+    /* Experiment 0x8000: the mesh shader counts at the end of the task emulation buffer
+     * (ac_ps5_mesh_experiments), which the records name in place of a publish ring. */
+-   if (!publish_ring && (radv_ps5_task_emu_debug() & 0x8000))
++   if (!publish_ring && (radv_ps5_task_emu_debug() & 0x4008000))
+       publish_ring = radv_buffer_get_va(device->task_emu_bo) + RADV_TASK_EMU_BYTES - 64;
+ 
+    radv_meta_mesh_draw_records(cmd_buffer, emu->draw_ring_va, AC_TASK_DRAW_ENTRY_BYTES, count_va, count,
+diff --git a/src/amd/vulkan/radv_physical_device.c b/src/amd/vulkan/radv_physical_device.c
+index c864a48..aa731de 100644
+--- a/src/amd/vulkan/radv_physical_device.c
++++ b/src/amd/vulkan/radv_physical_device.c
+@@ -395,7 +395,7 @@ radv_device_get_cache_uuid(struct radv_physical_device *pdev, void *uuid)
+ #ifdef RADV_PS5
+    {
+       /* The mesh lowering's experiments change the code (ac_ps5_mesh_experiments). */
+-      const unsigned experiments = ac_ps5_mesh_experiments() & 0x2569b80;
++      const unsigned experiments = ac_ps5_mesh_experiments() & 0x6569b80;
+       if (experiments)
+          _mesa_blake3_update(&ctx, &experiments, sizeof(experiments));
+    }
+diff --git a/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.c b/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.c
+index 572b29a..8942645 100644
+--- a/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.c
++++ b/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.c
+@@ -600,6 +600,23 @@ radv_ps5_dump_task_emu(void)
+               " (workgroup %u lanes, wave %u)\n",
+               counts[0], counts[1], counts[2], (unsigned)((t[4] >> 32) & 0xffff), (unsigned)(t[4] >> 48));
+    radv_ps5_dump_words("workgroups started before chunk 0..11", counters + 16, 12);
++   /* Experiment 0x4000000: every mesh wave's exports, a 1 KiB slot each below the counters
++    * (ac_nir_lower_ngg_mesh.c, ms_ps5_capture_base), to a file. */
++   uint32_t waves;
++   if (radv_ps5_stall_read(counters + 12, &waves) && waves) {
++      const uint32_t slots = MIN2(waves, (48u << 20) / 1024u);
++      const uint64_t base = counters - (48ull << 20);
++      uint32_t probe;
++      if (radv_ps5_stall_read(base, &probe) && radv_ps5_stall_read(base + slots * 1024ull - 4, &probe)) {
++         radv_ps5_cpu_flush((const void *)(uintptr_t)base, slots * 1024ull);
++         FILE *f = fopen("/data/eglantineps5/logs/mesh-exports.bin", "wb");
++         if (f) {
++            const size_t written = fwrite((const void *)(uintptr_t)base, 1024, slots, f);
++            fclose(f);
++            fprintf(stderr, "radv/ps5 stall: mesh exports of %u waves written (%zu)\n", waves, written);
++         }
++      }
++   }
+    fflush(stderr);
+ }
+ 
+-- 
+2.53.0
+
