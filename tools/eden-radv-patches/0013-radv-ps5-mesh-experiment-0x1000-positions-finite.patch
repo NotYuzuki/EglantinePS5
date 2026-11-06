@@ -1,0 +1,72 @@
+From f4427a9a32a94b1513b92fbbc11b4a98e0db8c00 Mon Sep 17 00:00:00 2001
+From: exploitizm <351399878+exploitizm@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 15:26:28 +1000
+Subject: [PATCH] radv/ps5: mesh experiment 0x1000, positions finite
+
+Run 15:21 (0x801): with every mesh workgroup allocating and exporting the
+most, the same draw hangs, so the counts do not matter; with every workgroup
+exporting only GFX10's fully-culled dummy, a NaN position, the first chunk
+hangs. 0x1000 replaces a position component that is not finite with 0 (w 1).
+---
+ src/amd/common/nir/ac_nir_lower_ngg_mesh.c | 17 ++++++++++++++++-
+ src/amd/vulkan/radv_physical_device.c      |  2 +-
+ 2 files changed, 17 insertions(+), 2 deletions(-)
+
+diff --git a/src/amd/common/nir/ac_nir_lower_ngg_mesh.c b/src/amd/common/nir/ac_nir_lower_ngg_mesh.c
+index 7f9f3e1..698e9f2 100644
+--- a/src/amd/common/nir/ac_nir_lower_ngg_mesh.c
++++ b/src/amd/common/nir/ac_nir_lower_ngg_mesh.c
+@@ -11,6 +11,7 @@
+ #include "nir_builder.h"
+ 
+ #ifdef RADV_PS5
++#include <math.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ 
+@@ -20,7 +21,8 @@
+  * its first wave, 0x200 has a workgroup that would allocate nothing
+  * allocate one vertex and one null primitive, 0x800 has every workgroup
+  * allocate and export the most vertices and primitives, those past its own
+- * primitive count null. The RADV cache UUID takes the mask too. */
++ * primitive count null, 0x1000 exports no position component that is not
++ * finite. The RADV cache UUID takes the mask too. */
+ unsigned
+ ac_ps5_mesh_experiments(void)
+ {
+@@ -1051,6 +1053,19 @@ emit_ms_vertex(nir_builder *b, nir_def *index, nir_def *row, bool exports, bool
+ {
+    ms_emit_arrayed_outputs(b, index, per_vertex_outputs, s);
+ 
++#ifdef RADV_PS5
++   if (exports && (ac_ps5_mesh_experiments() & 0x1000)) {
++      /* No position component that is not finite: 0, or 1 for w. */
++      for (unsigned c = 0; c < 4; c++) {
++         nir_def *v = s->out.outputs[VARYING_SLOT_POS][c];
++         if (!v || v->bit_size != 32)
++            continue;
++         nir_def *finite = nir_flt(b, nir_fabs(b, v), nir_imm_float(b, INFINITY));
++         s->out.outputs[VARYING_SLOT_POS][c] = nir_bcsel(b, finite, v, nir_imm_float(b, c == 3 ? 1.0f : 0.0f));
++      }
++   }
++#endif
++
+    if (exports) {
+       ac_nir_export_position(b, s->ac->gfx_level, s->options->export_clipdist_mask, false, false,
+                              !s->has_param_exports, false, s->per_vertex_outputs | VARYING_BIT_POS,
+diff --git a/src/amd/vulkan/radv_physical_device.c b/src/amd/vulkan/radv_physical_device.c
+index 47d97f2..11982a3 100644
+--- a/src/amd/vulkan/radv_physical_device.c
++++ b/src/amd/vulkan/radv_physical_device.c
+@@ -395,7 +395,7 @@ radv_device_get_cache_uuid(struct radv_physical_device *pdev, void *uuid)
+ #ifdef RADV_PS5
+    {
+       /* The mesh lowering's experiments change the code (ac_ps5_mesh_experiments). */
+-      const unsigned experiments = ac_ps5_mesh_experiments() & 0xb80;
++      const unsigned experiments = ac_ps5_mesh_experiments() & 0x1b80;
+       if (experiments)
+          _mesa_blake3_update(&ctx, &experiments, sizeof(experiments));
+    }
+-- 
+2.53.0
+
