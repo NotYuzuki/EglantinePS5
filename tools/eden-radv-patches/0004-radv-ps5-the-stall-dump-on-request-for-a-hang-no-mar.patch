@@ -1,7 +1,7 @@
 From 1b8b30db401f95c14559e2011132281694e62f75 Mon Sep 17 00:00:00 2001
 From: exploitizm <351399878+exploitizm@users.noreply.github.com>
 Date: Fri, 6 Nov 2026 10:52:09 +1000
-Subject: [PATCH 4/4] radv/ps5: the stall dump on request, for a hang no marker
+Subject: [PATCH 4/8] radv/ps5: the stall dump on request, for a hang no marker
  wait sees
 
 radv_ps5_queue_wait_seq dumps a stalled submission only while a thread polls

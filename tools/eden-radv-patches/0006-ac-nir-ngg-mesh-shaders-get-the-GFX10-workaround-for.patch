@@ -1,8 +1,8 @@
-From 873719e3fab7e97aafe20f586286db53a459cbb7 Mon Sep 17 00:00:00 2001
+From f22424314940e366f1a5e326041483a7c6c06234 Mon Sep 17 00:00:00 2001
 From: exploitizm <351399878+exploitizm@users.noreply.github.com>
 Date: Fri, 6 Nov 2026 14:33:57 +1000
-Subject: [PATCH] ac/nir/ngg: mesh shaders get the GFX10 workaround for fully
- culled workgroups
+Subject: [PATCH 6/8] ac/nir/ngg: mesh shaders get the GFX10 workaround for
+ fully culled workgroups
 
 GFX10 hangs when an NGG workgroup allocates no primitive
 (has_ngg_fully_culled_bug); the vertex and geometry shader paths export a

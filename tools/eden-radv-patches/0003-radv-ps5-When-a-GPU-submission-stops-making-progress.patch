@@ -1,7 +1,7 @@
 From c7f2756f3b4adab8fb333529a49f936f0d07e14b Mon Sep 17 00:00:00 2001
 From: Oliv3rmoon <oliv3rmoon@users.noreply.github.com>
 Date: Thu, 29 Oct 2026 12:46:08 -0700
-Subject: [PATCH 3/4] radv/ps5: When a GPU submission stops making progress,
+Subject: [PATCH 3/8] radv/ps5: When a GPU submission stops making progress,
  say what it carried before the console is gone.
 
 The PS5 winsys gives up on a submission whose completion marker has not moved for ten seconds and

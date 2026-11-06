@@ -1,5 +1,10 @@
 # Ocarina of Time task/mesh hang: handoff (2026-11-06)
 
+**Resolved 2026-11-07:** mesh shaders of emulated task draws now run as compute, and Ocarina
+plays. See [MESH_COMPUTE_DESIGN.md](MESH_COMPUTE_DESIGN.md). What follows is the investigation;
+its experiments are no longer in the driver (they are on the local `eden-radv-experiments`
+branch of the checkout this describes).
+
 Goal: Ocarina of Time (`0400486024dec000`, a Switch 2 title) freezes right after its intro movie,
 the moment it issues its first task+mesh draws. Fix it, so the game plays without
 `EDEN_NX2_NO_MESH=1`. Everything below is from the session that got as far as instrumenting the

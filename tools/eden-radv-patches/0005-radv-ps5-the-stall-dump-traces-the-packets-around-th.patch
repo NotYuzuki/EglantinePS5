@@ -1,8 +1,8 @@
 From 2eb0f32dfe9f01f7992c7811b93496a425207398 Mon Sep 17 00:00:00 2001
 From: exploitizm <351399878+exploitizm@users.noreply.github.com>
 Date: Fri, 6 Nov 2026 13:18:48 +1000
-Subject: [PATCH] radv/ps5: the stall dump traces the packets around the stop
- and the last emulated task draw
+Subject: [PATCH 5/8] radv/ps5: the stall dump traces the packets around the
+ stop and the last emulated task draw
 
 Diagnostics for a task+mesh hang (Ocarina of Time on Eden): the stall dump
 named the wait the GPU stopped at, a CB/DB end-of-pipe flush after an emulated

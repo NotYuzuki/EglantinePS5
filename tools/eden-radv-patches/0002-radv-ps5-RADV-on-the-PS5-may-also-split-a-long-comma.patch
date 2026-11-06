@@ -1,7 +1,7 @@
 From def3fa14bd7dc297d9a4f5941fc94733bbcabdfd Mon Sep 17 00:00:00 2001
 From: Oliv3rmoon <oliv3rmoon@users.noreply.github.com>
 Date: Thu, 29 Oct 2026 12:46:08 -0700
-Subject: [PATCH 2/4] radv/ps5: RADV on the PS5 may also split a long command
+Subject: [PATCH 2/8] radv/ps5: RADV on the PS5 may also split a long command
  stream before a transfer or a barrier.
 
 One AGC submission carries at most about a million words, and each starts from reset GPU state,
