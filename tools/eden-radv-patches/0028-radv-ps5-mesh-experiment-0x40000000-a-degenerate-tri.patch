@@ -1,0 +1,115 @@
+From ff1d684b62f5b1619c95fcf41136c3a9cc5eb802 Mon Sep 17 00:00:00 2001
+From: exploitizm <351399878+exploitizm@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 20:43:58 +1000
+Subject: [PATCH] radv/ps5: mesh experiment 0x40000000, a degenerate triangle
+ for each vertex no primitive names
+
+Run 20:41 (0x20008001): with the vertices past the last a primitive names
+cut, the GPU runs 212 mesh workgroups of the real geometry, against 15, and
+stops at draw 98 instead of 70. Exported vertices no primitive names are a
+cause; the cut leaves those between named ones. 0x40000000 has wave 0 find
+them (the primitives' indices in LDS) and give each a degenerate triangle
+(v, v, v) after the workgroup's own, while the 126 primitives allow: the
+primitive assembler fetches it and culls it, and no vertex goes unnamed.
+---
+ src/amd/common/nir/ac_nir_lower_ngg_mesh.c | 56 ++++++++++++++++++++--
+ src/amd/vulkan/radv_physical_device.c      |  2 +-
+ 2 files changed, 54 insertions(+), 4 deletions(-)
+
+diff --git a/src/amd/common/nir/ac_nir_lower_ngg_mesh.c b/src/amd/common/nir/ac_nir_lower_ngg_mesh.c
+index 05d1096..531e6ae 100644
+--- a/src/amd/common/nir/ac_nir_lower_ngg_mesh.c
++++ b/src/amd/common/nir/ac_nir_lower_ngg_mesh.c
+@@ -32,8 +32,9 @@
+  * a workgroup's index, 0x4000000 captures every wave's exports
+  * (ms_ps5_capture_base), 0x8000000 exports primitives before vertices,
+  * 0x10000000 nulls the primitives that name a vertex of an earlier wave,
+- * 0x20000000 cuts the vertex count to the highest index a primitive names + 1.
+- * The RADV cache UUID takes the mask too. */
++ * 0x20000000 cuts the vertex count to the highest index a primitive names + 1,
++ * 0x40000000 gives each vertex no primitive names a degenerate triangle. The
++ * RADV cache UUID takes the mask too. */
+ unsigned
+ ac_ps5_mesh_experiments(void)
+ {
+@@ -889,6 +890,55 @@ set_ms_final_output_counts(nir_builder *b,
+       nir_pop_if(b, if_wave_0);
+       num_vtx = nir_if_phi(b, trimmed, num_vtx);
+    }
++   if ((ac_ps5_mesh_experiments() & 0x40000000) && !s->prim_parts && s->vertices_per_prim == 3 &&
++       !(s->layout.var.prm_attr.mask & VARYING_BIT_PRIMITIVE_INDICES) &&
++       b->shader->info.mesh.max_vertices_out <= 2 * s->wave_size) {
++      /* Every vertex a primitive names: wave 0 gives each vertex no primitive names a
++       * degenerate triangle (v, v, v) after the workgroup's own, while there is room. */
++      const unsigned max_prims = b->shader->info.mesh.max_primitives_out;
++      nir_if *if_wave_0 = nir_push_if(b, nir_ieq_imm(b, nir_load_subgroup_id(b), 0));
++      nir_def *grown;
++      {
++         nir_def *lane = nir_load_subgroup_invocation(b);
++         nir_def *total = nir_imul_imm(b, num_prm, 3);
++         nir_def *v[2] = {lane, nir_iadd_imm(b, lane, s->wave_size)};
++         nir_variable *ref_var[2];
++         nir_variable *i_var = nir_local_variable_create(b->impl, glsl_uint_type(), "ms_ref_i");
++         for (unsigned h = 0; h < 2; h++) {
++            ref_var[h] = nir_local_variable_create(b->impl, glsl_bool_type(), "ms_ref");
++            nir_store_var(b, ref_var[h], nir_imm_false(b), 0x1);
++         }
++         nir_store_var(b, i_var, nir_imm_int(b, 0), 0x1);
++         nir_push_loop(b);
++         {
++            nir_def *i = nir_load_var(b, i_var);
++            nir_break_if(b, nir_uge(b, i, total));
++            nir_def *idx = nir_u2u32(b, nir_load_shared(b, 1, 8, i, .base = s->layout.lds.indices_addr));
++            for (unsigned h = 0; h < 2; h++)
++               nir_store_var(b, ref_var[h], nir_ior(b, nir_load_var(b, ref_var[h]), nir_ieq(b, idx, v[h])), 0x1);
++            nir_store_var(b, i_var, nir_iadd_imm(b, i, 1), 0x1);
++         }
++         nir_pop_loop(b, NULL);
++
++         nir_def *base = num_prm;
++         for (unsigned h = 0; h < 2; h++) {
++            nir_def *unref = nir_iand(b, nir_ult(b, v[h], num_vtx), nir_inot(b, nir_load_var(b, ref_var[h])));
++            nir_def *mask = nir_ballot(b, 1, s->wave_size, unref);
++            nir_def *prim = nir_mbcnt_amd(b, mask, base);
++            nir_if *if_room = nir_push_if(b, nir_iand(b, unref, nir_ult_imm(b, prim, max_prims)));
++            {
++               nir_def *addr = nir_imul_imm(b, prim, 3);
++               nir_def *vb = nir_u2u8(b, v[h]);
++               nir_store_shared(b, nir_vec3(b, vb, vb, vb), addr, .base = s->layout.lds.indices_addr, .align_mul = 1);
++            }
++            nir_pop_if(b, if_room);
++            base = nir_iadd(b, base, nir_bit_count(b, mask));
++         }
++         grown = nir_bcsel(b, nir_ieq_imm(b, num_prm, 0), num_prm, nir_umin(b, base, nir_imm_int(b, max_prims)));
++      }
++      nir_pop_if(b, if_wave_0);
++      num_prm = nir_if_phi(b, grown, num_prm);
++   }
+    if ((ac_ps5_mesh_experiments() & 0x200) && !(ac_ps5_mesh_experiments() & 0x800) && !s->prim_parts) {
+       /* No workgroup allocates nothing: one vertex and one null primitive instead. */
+       nir_def *none = nir_ieq_imm(b, num_prm, 0);
+@@ -899,7 +949,7 @@ set_ms_final_output_counts(nir_builder *b,
+    }
+    /* Wave 0 exports with the counts these variables hold (the other waves take them from
+     * LDS below): the counts changed above must be its too. */
+-   if (ac_ps5_mesh_experiments() & 0x20000380) {
++   if (ac_ps5_mesh_experiments() & 0x60000380) {
+       nir_store_var(b, s->primitive_count_var, num_prm, 0x1);
+       nir_store_var(b, s->vertex_count_var, num_vtx, 0x1);
+    }
+diff --git a/src/amd/vulkan/radv_physical_device.c b/src/amd/vulkan/radv_physical_device.c
+index 8aa9cc3..eb5e08b 100644
+--- a/src/amd/vulkan/radv_physical_device.c
++++ b/src/amd/vulkan/radv_physical_device.c
+@@ -395,7 +395,7 @@ radv_device_get_cache_uuid(struct radv_physical_device *pdev, void *uuid)
+ #ifdef RADV_PS5
+    {
+       /* The mesh lowering's experiments change the code (ac_ps5_mesh_experiments). */
+-      const unsigned experiments = ac_ps5_mesh_experiments() & 0x3e569b80;
++      const unsigned experiments = ac_ps5_mesh_experiments() & 0x7e569b80;
+       if (experiments)
+          _mesa_blake3_update(&ctx, &experiments, sizeof(experiments));
+    }
+-- 
+2.53.0
+
