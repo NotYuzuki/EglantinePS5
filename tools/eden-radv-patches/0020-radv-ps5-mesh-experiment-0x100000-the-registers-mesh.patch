@@ -1,0 +1,72 @@
+From 6beae906c30195285dde2b817eb7c526e8bc5917 Mon Sep 17 00:00:00 2001
+From: exploitizm <351399878+exploitizm@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 17:57:03 +1000
+Subject: [PATCH] radv/ps5: mesh experiment 0x100000, the registers' mesh
+ workgroup in whole waves
+
+Run 17:55 (0x98001): without late alloc the same draw hangs, after the same
+15 workgroups whose 60 waves all ended. Ocarina's mesh workgroup is 126 lanes
+(126 primitives); the NGG lowering runs it as align(126, wave) = 128 lanes
+(radv_shader.c, max_workgroup_size), but VGT_GS_MAX_VERT_OUT and the rest
+take info->workgroup_size, 126. 0x100000 rounds that up to whole waves too.
+---
+ src/amd/common/nir/ac_nir_lower_ngg_mesh.c | 3 ++-
+ src/amd/vulkan/radv_physical_device.c      | 2 +-
+ src/amd/vulkan/radv_shader_info.c          | 7 +++++++
+ 3 files changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/src/amd/common/nir/ac_nir_lower_ngg_mesh.c b/src/amd/common/nir/ac_nir_lower_ngg_mesh.c
+index ad608ac..918a6f8 100644
+--- a/src/amd/common/nir/ac_nir_lower_ngg_mesh.c
++++ b/src/amd/common/nir/ac_nir_lower_ngg_mesh.c
+@@ -25,7 +25,8 @@
+  * finite, 0x8000 counts at the end of the task emulation buffer the
+  * workgroups that start, and the waves that reach the finale and its end
+  * (ms_ps5_count), 0x20000 exports every position as (0, 0, 0, 1), 0x40000
+- * every primitive null. The RADV cache UUID takes the mask too. */
++ * every primitive null, 0x100000 rounds the registers' mesh workgroup up to
++ * whole waves (radv_shader_info.c). The RADV cache UUID takes the mask too. */
+ unsigned
+ ac_ps5_mesh_experiments(void)
+ {
+diff --git a/src/amd/vulkan/radv_physical_device.c b/src/amd/vulkan/radv_physical_device.c
+index 958567f..c33ecac 100644
+--- a/src/amd/vulkan/radv_physical_device.c
++++ b/src/amd/vulkan/radv_physical_device.c
+@@ -395,7 +395,7 @@ radv_device_get_cache_uuid(struct radv_physical_device *pdev, void *uuid)
+ #ifdef RADV_PS5
+    {
+       /* The mesh lowering's experiments change the code (ac_ps5_mesh_experiments). */
+-      const unsigned experiments = ac_ps5_mesh_experiments() & 0x69b80;
++      const unsigned experiments = ac_ps5_mesh_experiments() & 0x169b80;
+       if (experiments)
+          _mesa_blake3_update(&ctx, &experiments, sizeof(experiments));
+    }
+diff --git a/src/amd/vulkan/radv_shader_info.c b/src/amd/vulkan/radv_shader_info.c
+index 4fc5f6e..8028edd 100644
+--- a/src/amd/vulkan/radv_shader_info.c
++++ b/src/amd/vulkan/radv_shader_info.c
+@@ -4,6 +4,7 @@
+  * SPDX-License-Identifier: MIT
+  */
+ #include "radv_shader_info.h"
++#include "nir/ac_nir.h"
+ #include "nir/nir.h"
+ #include "nir/nir_xfb_info.h"
+ #include "nir/radv_nir.h"
+@@ -817,6 +818,12 @@ calc_mesh_workgroup_size(const struct radv_compiler_info *compiler_info, const n
+          ngg_info->hw_max_esverts, ngg_info->max_gsprims, ngg_info->max_out_verts, ngg_info->prim_amp_factor);
+ 
+       info->workgroup_size = MAX2(min_ngg_workgroup_size, api_workgroup_size);
++#ifdef RADV_PS5
++      /* Experiment 0x100000 (ac_ps5_mesh_experiments): the registers (VGT_GS_MAX_VERT_OUT) take the
++       * hardware workgroup the lowering runs, which it rounds up to whole waves. */
++      if (ac_ps5_mesh_experiments() & 0x100000)
++         info->workgroup_size = align(info->workgroup_size, 32);
++#endif
+    }
+ }
+ 
+-- 
+2.53.0
+
