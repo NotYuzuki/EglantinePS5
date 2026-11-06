@@ -1,0 +1,57 @@
+From 8a2114ce2fbcde0a2098a678ef9eae0c14c722aa Mon Sep 17 00:00:00 2001
+From: exploitizm <351399878+exploitizm@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 17:27:47 +1000
+Subject: [PATCH] radv/ps5: mesh experiment 0x80000, no late alloc for mesh
+ shaders
+
+Runs 17:23 and 17:25 (0x78001): with neutral geometry and no empty records
+the GPU runs ten times further, 145 mesh workgroups, all of whose waves end,
+and stops at the same draw each time; with real geometry at 15. A deadlock
+that comes later the less each workgroup does, after its waves end, is what
+late alloc is known for on GFX10 (ac_compute_late_alloc: CUs 2-3 masked, the
+limit capped, NGG without it on Navi14). Upstream gives mesh shaders late
+alloc on GFX10.3 only. 0x80000 gives them none.
+---
+ src/amd/vulkan/radv_cmd_buffer.c | 3 ++-
+ src/amd/vulkan/radv_shader.c     | 4 ++++
+ 2 files changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
+index 7e4a39f..c05c8d6 100644
+--- a/src/amd/vulkan/radv_cmd_buffer.c
++++ b/src/amd/vulkan/radv_cmd_buffer.c
+@@ -15452,7 +15452,8 @@ extern uint64_t radv_ps5_task_emu_note[8];
+  * stall dump stopping at that marker says the mesh shaders never finished; 0x80 and 0x100 change
+  * the mesh lowering (ac_ps5_mesh_experiments); 0x4000 leaves GE_CNTL.VERT_GRP_SIZE of mesh shaders
+  * out of GFX10's NGG workaround; 0x10000 leaves the records of task workgroups without mesh
+- * workgroups out of a chunk's mesh draw (radv_task_emu_compacts). */
++ * workgroups out of a chunk's mesh draw (radv_task_emu_compacts); 0x80000 gives mesh shaders no
++ * late alloc (radv_precompute_registers_hw_ngg). */
+ uint32_t
+ radv_ps5_task_emu_debug(void)
+ {
+diff --git a/src/amd/vulkan/radv_shader.c b/src/amd/vulkan/radv_shader.c
+index 286b30e..26775db 100644
+--- a/src/amd/vulkan/radv_shader.c
++++ b/src/amd/vulkan/radv_shader.c
+@@ -9,6 +9,7 @@
+  */
+ 
+ #include "radv_shader.h"
++#include "radv_cmd_buffer.h"
+ #if defined(RADV_PS5)
+ #include "winsys/ps5/radv_ps5_winsys_public.h" /* ProsperoEden: tools/patch-radv-submission-dump.py */
+ #endif
+@@ -1837,6 +1838,9 @@ radv_precompute_registers_hw_ngg(struct radv_device *device, struct radv_shader
+       unsigned late_alloc_wave64, cu_mask;
+       ac_compute_late_alloc(&pdev->info, true, info->has_ngg_culling, config->scratch_bytes_per_wave > 0,
+                             &late_alloc_wave64, &cu_mask);
++      /* Experiment 0x80000 (radv_ps5_task_emu_debug): no late alloc for mesh shaders. */
++      if (shader->info.stage == MESA_SHADER_MESH && (radv_ps5_task_emu_debug() & 0x80000))
++         late_alloc_wave64 = 0;
+ 
+       regs->spi_shader_pgm_rsrc3_gs =
+          ac_apply_cu_en(S_00B21C_CU_EN(cu_mask) | S_00B21C_WAVE_LIMIT(0x3F), C_00B21C_CU_EN, 0, &pdev->info);
+-- 
+2.53.0
+
