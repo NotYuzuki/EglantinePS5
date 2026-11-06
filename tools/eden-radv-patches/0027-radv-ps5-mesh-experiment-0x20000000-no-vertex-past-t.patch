@@ -1,0 +1,102 @@
+From 291c4aff77518a81059c930338ac8d2b72c62e67 Mon Sep 17 00:00:00 2001
+From: exploitizm <351399878+exploitizm@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 20:26:42 +1000
+Subject: [PATCH] radv/ps5: mesh experiment 0x20000000, no vertex past the last
+ a primitive names
+
+The 20:16 hang's klog unit status: PA, SX and SPI busy, GE, SC and CB idle;
+primitive assembly and the shader exporter stuck against each other. The
+captured exports (19:47): the passing chunk's workgroups export 1 to 3
+vertices no primitive names, at their end; the hanging chunk's second
+exports 21 (43 to 63). An NGG vertex shader's subgroup never holds a vertex
+none of its primitives names. 0x20000000 has wave 0 read the primitives'
+indices from LDS and cut the vertex count to the highest + 1.
+
+Also: wave 0 exports with the count variables, which the counts the
+experiments change (0x80, 0x100, 0x200 and this) did not reach; they do
+now. 0x80's first-chunk hang was that mismatch.
+---
+ src/amd/common/nir/ac_nir_lower_ngg_mesh.c | 39 ++++++++++++++++++++--
+ src/amd/vulkan/radv_physical_device.c      |  2 +-
+ 2 files changed, 38 insertions(+), 3 deletions(-)
+
+diff --git a/src/amd/common/nir/ac_nir_lower_ngg_mesh.c b/src/amd/common/nir/ac_nir_lower_ngg_mesh.c
+index b5a0660..05d1096 100644
+--- a/src/amd/common/nir/ac_nir_lower_ngg_mesh.c
++++ b/src/amd/common/nir/ac_nir_lower_ngg_mesh.c
+@@ -31,8 +31,9 @@
+  * from a shader without any, 0x2000000 adds its record's first_workgroup to
+  * a workgroup's index, 0x4000000 captures every wave's exports
+  * (ms_ps5_capture_base), 0x8000000 exports primitives before vertices,
+- * 0x10000000 nulls the primitives that name a vertex of an earlier wave. The
+- * RADV cache UUID takes the mask too. */
++ * 0x10000000 nulls the primitives that name a vertex of an earlier wave,
++ * 0x20000000 cuts the vertex count to the highest index a primitive names + 1.
++ * The RADV cache UUID takes the mask too. */
+ unsigned
+ ac_ps5_mesh_experiments(void)
+ {
+@@ -860,6 +861,34 @@ set_ms_final_output_counts(nir_builder *b,
+       num_prm = nir_umin(b, num_prm, nir_imm_int(b, s->wave_size));
+       num_vtx = nir_umin(b, num_vtx, nir_imm_int(b, s->wave_size));
+    }
++   if ((ac_ps5_mesh_experiments() & 0x20000000) && !s->prim_parts &&
++       !(s->layout.var.prm_attr.mask & VARYING_BIT_PRIMITIVE_INDICES)) {
++      /* No vertex past the last a primitive names: wave 0, which has the counts, reads the
++       * primitives' indices from LDS and cuts the vertex count to the highest one + 1. */
++      nir_if *if_wave_0 = nir_push_if(b, nir_ieq_imm(b, nir_load_subgroup_id(b), 0));
++      nir_def *trimmed;
++      {
++         nir_variable *max_var = nir_local_variable_create(b->impl, glsl_uint_type(), "ms_max_index");
++         nir_variable *i_var = nir_local_variable_create(b->impl, glsl_uint_type(), "ms_index_i");
++         nir_store_var(b, max_var, nir_imm_int(b, 0), 0x1);
++         nir_store_var(b, i_var, nir_load_subgroup_invocation(b), 0x1);
++         nir_def *total = nir_imul_imm(b, num_prm, s->vertices_per_prim);
++         nir_push_loop(b);
++         {
++            nir_def *i = nir_load_var(b, i_var);
++            nir_break_if(b, nir_uge(b, i, total));
++            nir_def *v = nir_u2u32(b, nir_load_shared(b, 1, 8, i, .base = s->layout.lds.indices_addr));
++            nir_store_var(b, max_var, nir_umax(b, nir_load_var(b, max_var), v), 0x1);
++            nir_store_var(b, i_var, nir_iadd_imm(b, i, s->wave_size), 0x1);
++         }
++         nir_pop_loop(b, NULL);
++         nir_def *max_index = nir_reduce(b, nir_load_var(b, max_var), .reduction_op = nir_op_umax);
++         trimmed = nir_bcsel(b, nir_ieq_imm(b, num_prm, 0), num_vtx,
++                             nir_umin(b, num_vtx, nir_iadd_imm(b, max_index, 1)));
++      }
++      nir_pop_if(b, if_wave_0);
++      num_vtx = nir_if_phi(b, trimmed, num_vtx);
++   }
+    if ((ac_ps5_mesh_experiments() & 0x200) && !(ac_ps5_mesh_experiments() & 0x800) && !s->prim_parts) {
+       /* No workgroup allocates nothing: one vertex and one null primitive instead. */
+       nir_def *none = nir_ieq_imm(b, num_prm, 0);
+@@ -868,6 +897,12 @@ set_ms_final_output_counts(nir_builder *b,
+       s->null_prim_var = nir_local_variable_create(b->impl, glsl_bool_type(), "ms_null_prim");
+       nir_store_var(b, s->null_prim_var, none, 0x1);
+    }
++   /* Wave 0 exports with the counts these variables hold (the other waves take them from
++    * LDS below): the counts changed above must be its too. */
++   if (ac_ps5_mesh_experiments() & 0x20000380) {
++      nir_store_var(b, s->primitive_count_var, num_prm, 0x1);
++      nir_store_var(b, s->vertex_count_var, num_vtx, 0x1);
++   }
+ #endif
+ 
+    *out_num_prm = num_prm;
+diff --git a/src/amd/vulkan/radv_physical_device.c b/src/amd/vulkan/radv_physical_device.c
+index 6dbdeb1..8aa9cc3 100644
+--- a/src/amd/vulkan/radv_physical_device.c
++++ b/src/amd/vulkan/radv_physical_device.c
+@@ -395,7 +395,7 @@ radv_device_get_cache_uuid(struct radv_physical_device *pdev, void *uuid)
+ #ifdef RADV_PS5
+    {
+       /* The mesh lowering's experiments change the code (ac_ps5_mesh_experiments). */
+-      const unsigned experiments = ac_ps5_mesh_experiments() & 0x1e569b80;
++      const unsigned experiments = ac_ps5_mesh_experiments() & 0x3e569b80;
+       if (experiments)
+          _mesa_blake3_update(&ctx, &experiments, sizeof(experiments));
+    }
+-- 
+2.53.0
+
