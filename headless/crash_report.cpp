@@ -34,6 +34,12 @@ std::size_t eden_heap_large_held(unsigned* blocks);
 // The app's code, from the link (tools/unwind.ld).
 extern const char __eden_text_start[];
 extern const char __eden_text_end[];
+// The Vulkan driver's stall dump on request: RADV's winsys sets it when it creates its queue
+// (radv_ps5_winsys.c, radv_ps5_offer_stall_dump); null without RADV. The hang report calls it
+// first. Its own ten-second check runs only while a thread polls a submission's marker, and in
+// Ocarina of Time's hang none did (the submitting thread blocked in the kernel, the others on
+// Vulkan semaphores), so the driver said nothing about where the GPU stopped.
+void (*eden_radv_stall_dump)(void) = nullptr;
 }
 
 namespace Eden::Crash {
@@ -67,6 +73,7 @@ std::atomic<int> state{kIdle};
 std::atomic<std::uintptr_t> reporter{0};  // the thread writing the report
 std::atomic<bool> helper_failed{false};   // the system refused both the restart and the exit
 std::atomic<bool> leave{false};           // close the app instead of starting it again
+std::atomic<bool> gpu_stalled{false};     // the driver found its GPU stopped (eden_gpu_stalled)
 std::atomic<bool> game_started{false};
 std::atomic<bool> game_running{false};  // the session is a game (the hang watch)
 
@@ -448,9 +455,11 @@ bool Enter() noexcept {
 void WriteReport(const Kind* kind, int code, std::uint64_t address, const Registers& registers,
                  const char* reason) noexcept {
     // Right after a restart, with no game started since: the crash comes with starting the app,
-    // and starting it again would only repeat it.
+    // and starting it again would only repeat it. After the driver found its GPU stopped, the app
+    // would only start again on that GPU: it closes, as on VK_ERROR_DEVICE_LOST.
     const bool restart = !(restarted_process && !game_started.load(std::memory_order_relaxed) &&
-                           std::time(nullptr) - started_at < 60);
+                           std::time(nullptr) - started_at < 60) &&
+                         !gpu_stalled.load(std::memory_order_acquire);
     leave.store(!restart, std::memory_order_release);
     const Stamp stamp = LocalNow();
     Compose(kind, code, address, registers, reason, stamp, restart);
@@ -584,6 +593,8 @@ void PutStamp(Text<160 * 1024>& t, const Stamp& stamp) noexcept {
 }
 
 void WriteHangReport(unsigned seconds, unsigned long long frames) noexcept {
+    // What the GPU was stuck on, in stderr.log, before the threads are asked for their stacks.
+    if (const auto dump = __atomic_load_n(&eden_radv_stall_dump, __ATOMIC_ACQUIRE)) dump();
     const auto self = (std::uintptr_t)pthread_self();
     unsigned entries = 0, asked = 0, answered = 0;
     for (unsigned i = 0; i < kNamedThreads; ++i) {
@@ -698,6 +709,10 @@ void HangWatch() {
 }
 
 } // namespace
+
+void NoteGpuStalled() noexcept {
+    gpu_stalled.store(true, std::memory_order_release);
+}
 
 bool Readable(const void* address, std::size_t bytes) noexcept {
     char buffer[4096];
@@ -818,3 +833,10 @@ Last TakeLast(const std::string& logs_folder, const std::string& eden_log) {
 }
 
 } // namespace Eden::Crash
+
+// The driver's stall dump (radv_ps5_winsys.c, from Belladonna 318deb146da) calls this before
+// anything there could fault, once a submission has made no progress for ten seconds. RADV
+// declares it weak; defined here it is not left as an import the system cannot provide.
+extern "C" void eden_gpu_stalled(void) {
+    Eden::Crash::NoteGpuStalled();
+}

@@ -3,7 +3,9 @@
 # reuse the pinned RADV platform recipe for threads, libc, TLS and unwinding.
 eden_radv_link_recipe() {
     local archive=$1
-    local reference="$root/../mihawk-vulkan-review"
+    source "$root/tools/radv-refs.sh"
+    local reference
+    reference="$(eden_radv_refs)/mihawk-vulkan-review"
     local radv_sdk="$reference/.deps/native/ps5-payload-sdk"
     source "$reference/tools/radv-link.sh"
     radv_link_recipe "$reference" "$radv_sdk" "$archive" || return

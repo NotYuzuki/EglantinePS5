@@ -337,6 +337,16 @@ inline std::atomic<bool (*)()> graphics_memory_probe{nullptr};
 // the driver's count.
 inline std::atomic<unsigned long long (*)()> graphics_memory_free{nullptr};
 inline std::atomic<bool> graphics_usage_from_pool{true};
+// Lets go of every staging buffer Eden's pool keeps that the GPU is done with, and returns the bytes
+// given back (0 when called from another thread than the pool's, which owns its lists). Installed
+// by the staging pool (tools/prepare-vulkan-port.py, vulkan_staging_buffer_pool.cpp) at its first
+// frame tick. Eden lets kept buffers go one size level a frame, so a refused image or buffer asks
+// for this before the session ends on it (after Nightshade 07105769, RelieveMemory).
+inline std::atomic<unsigned long long (*)()> graphics_staging_release{nullptr};
+inline unsigned long long ReleaseIdleStaging() {
+    const auto release = graphics_staging_release.load(std::memory_order_acquire);
+    return release != nullptr ? release() : 0;
+}
 // GPU thread only (the collector).
 inline bool KeepDirtyTextures() {
     if (!gc_keep_dirty.load(std::memory_order_relaxed)) return false;

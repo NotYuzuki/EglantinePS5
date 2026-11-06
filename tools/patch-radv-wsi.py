@@ -5,8 +5,10 @@ import hashlib
 import sys
 
 root = Path(__file__).resolve().parents[1]
-source = root.parent/'mihawk-mesa-review/src/vulkan/wsi/wsi_common_videoout.c'
-target = root.parent/'mihawk-vulkan-review/.deps/work/radv-src/src/vulkan/wsi/wsi_common_videoout.c'
+# The driver checkouts' folder (tools/radv_refs.py: EDEN_RADV_REFS, .local/radv-refs).
+refs = __import__('runpy').run_path(str(root/'tools/radv_refs.py'))['radv_refs'](root)
+source = refs/'mihawk-mesa-review/src/vulkan/wsi/wsi_common_videoout.c'
+target = refs/'mihawk-vulkan-review/.deps/work/radv-src/src/vulkan/wsi/wsi_common_videoout.c'
 text = source.read_text()
 
 def replace(old, new):
@@ -43,16 +45,17 @@ text = (text[:body_start] + '   const char *const asked = getenv("EDEN_VIDEOOUT_
 # idles at the bottom of its range (a vblank every 20.87 ms, 48 Hz, in two reports), the output
 # went back to 59.94 Hz, and a game could not have 120 Hz at all. Only a display that stayed at
 # 59.94 Hz (a vblank about every 16.7 ms) gives the mode back.
-replace('         if (period > VIDEOOUT_HIGH_REFRESH_LIMIT_NS) {',
-        '         if (period > UINT64_C(15000000) && period < UINT64_C(18500000)) {')
+# PS5_Mesa 47e9eb61ee7 also takes the mode back when the vblank wait fails (a period of 0): kept.
+replace('         if (period == 0 || period > VIDEOOUT_HIGH_REFRESH_LIMIT_NS) {',
+        '         if (period == 0 || (period > UINT64_C(15000000) && period < UINT64_C(18500000))) {')
 # Say so when the display follows, as the pinned source does when it does not.
 replace('''                    (double)period / 1e6);
          }
-      } else {''', '''                    (double)period / 1e6);
+      } else if (supported > 0) {''', '''                    (double)period / 1e6);
          } else {
             fprintf(stderr, "wsi/videoout: 119.88 Hz output, a vblank every %.3f ms\\n", (double)period / 1e6);
          }
-      } else {''')
+      } else if (supported > 0) {''')
 replace('   wsi->base.get_support =', '   videoout_ref();\n\n   wsi->base.get_support =')
 replace('   if (wsi)\n      vk_free(alloc, wsi);',
         '   if (wsi) {\n      videoout_unref();\n      vk_free(alloc, wsi);\n      wsi_device->wsi[VK_ICD_WSI_PLATFORM_DISPLAY] = NULL;\n   }')
@@ -67,7 +70,7 @@ if changed:
     target.write_text(text)
     # Upstream caches the whole build by pin. Invalidate only that receipt;
     # Ninja retains all unchanged objects and rebuilds the patched WSI.
-    provenance = root.parent/'mihawk-vulkan-review/.deps/native/radv-release/PROVENANCE.txt'
+    provenance = refs/'mihawk-vulkan-review/.deps/native/radv-release/PROVENANCE.txt'
     if provenance.exists():
         provenance.replace(provenance.with_suffix('.base.txt'))
 if not checking:
@@ -170,8 +173,8 @@ radv_ps5_memory_grant_gpu(void *address, uint64_t bytes)
          '         return NULL;\n      radv_ps5_tally_add(RADV_PS5_TALLY_SUBMISSION, (int64_t)claim->dedicated.bytes);\n      queue->in_flight_count++;'),
     ],
 }.items():
-    original = root.parent/'mihawk-mesa-review'/relative
-    destination = root.parent/'mihawk-vulkan-review/.deps/work/radv-src'/relative
+    original = refs/'mihawk-mesa-review'/relative
+    destination = refs/'mihawk-vulkan-review/.deps/work/radv-src'/relative
     adapted = original.read_text()
     for old, new in replacements:
         assert adapted.count(old) == 1, f'Pinned initialization anchor changed: {relative}'
@@ -183,7 +186,7 @@ radv_ps5_memory_grant_gpu(void *address, uint64_t bytes)
         continue
     if destination.read_text() != adapted:
         destination.write_text(adapted)
-        provenance = root.parent/'mihawk-vulkan-review/.deps/native/radv-release/PROVENANCE.txt'
+        provenance = refs/'mihawk-vulkan-review/.deps/native/radv-release/PROVENANCE.txt'
         if provenance.exists():
             provenance.replace(provenance.with_suffix('.base.txt'))
     print(f'RADV initialization diagnostic {relative} sha256={hashlib.sha256(adapted.encode()).hexdigest()}')

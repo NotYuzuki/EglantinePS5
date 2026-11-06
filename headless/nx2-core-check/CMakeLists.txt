@@ -14,18 +14,13 @@ FetchContent_Declare(Catch2
     URL_HASH "SHA512=${catch_hash}")
 FetchContent_MakeAvailable(Catch2)
 file(GLOB ampere_tests CONFIGURE_DEPENDS "${EDEN_SOURCE}/src/tests/video_core/ampere_*.cpp")
-# These two integration tests link the complete shader compiler and run in upstream tests.
-# This host check exercises the header-only native capture/lowering and memory helpers.
-list(FILTER ampere_tests EXCLUDE REGEX "ampere_(bindless_tex|sured)\\.cpp$")
-add_executable(nx2-core-check ${ampere_tests}
-    "${EDEN_SOURCE}/src/tests/core/read_traps.cpp"
-    "${EDEN_SOURCE}/src/tests/core/nx2_readback_cache.cpp"
-    "${EDEN_SOURCE}/src/tests/core/nx2_core_readback_capacity.cpp"
-    "${EDEN_SOURCE}/src/tests/video_core/nx2_gpu_mappings.cpp"
-    "${EDEN_SOURCE}/src/tests/video_core/nx2_command_ranges.cpp"
-    "${EDEN_SOURCE}/src/tests/video_core/nx2_command_sync.cpp"
-    "${EDEN_SOURCE}/src/tests/video_core/nx2_sparse_region.cpp"
-    "${EDEN_SOURCE}/src/tests/video_core/memory_budget.cpp")
+# These integration tests link the complete shader compiler and run in upstream tests.
+# This host check exercises the header-only native capture/lowering helpers.
+list(FILTER ampere_tests EXCLUDE REGEX
+     "ampere_(async_copy|bindless_tex|fast_fusion_logged|geometry|logged_numeric|logged_textures|starfox_test10|sured|tennis_tessellation)\\.cpp$")
+# The readback, mapping-table, sparse-region and memory-budget tests left with the Lichii merge
+# (the GPU memory registry replaced them).
+add_executable(nx2-core-check ${ampere_tests})
 file(GLOB boost_includes "${DEPENDENCY_SOURCE}/.cache/cpm/boost/*/libs/*/include")
 target_include_directories(nx2-core-check PRIVATE "${EDEN_SOURCE}/src" "${FMT_INCLUDE}" ${boost_includes})
 target_link_libraries(nx2-core-check PRIVATE Catch2::Catch2WithMain)

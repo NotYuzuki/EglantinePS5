@@ -90,6 +90,13 @@ assert built == value['contentVersion'], f'the program says {built}, param.json 
 # The console gives a 120 Hz output (Settings > Video, headless/display_refresh.h) only to a title
 # that declares it. Declaring it changes nothing by itself: the output stays at 60 Hz until asked.
 assert int(value['attribute3']) & 0x80040 == 0x80040, 'param.json no longer declares the 120 Hz output'
+# Bit 22: PS5 Pro memory mode, a 13,504 MiB direct memory pool instead of 12,288 MiB on a Pro
+# (ProsperoEden #139, measured on system software 13.60). A base PS5 keeps 12,288 MiB.
+assert int(value['attribute3']) & 0x400000, 'param.json no longer asks for PS5 Pro memory mode'
+# The flexible memory pool (the program, the system's libraries, anonymous mappings): what it is
+# smaller than the system's 448 MiB goes to the direct pool, the one games run out of. ProsperoEden
+# measured a game session at 203 MiB of it; the launch log says what is left free.
+assert value['kernel']['flexibleMemorySize'] == 320 << 20, 'param.json no longer sets the flexible memory pool'
 runpy.run_path(str(root / 'tools/load_alignment.py'))['check_load_alignment']((app / 'eboot.bin').read_bytes())
 profile = (root / 'build/headless-native/CMakeCache.txt').read_text()
 assert sum(profile.count('EDEN_DEVICE_FRONTEND:BOOL=' + v) for v in ('ON', 'OFF')) == 1

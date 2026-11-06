@@ -1,0 +1,188 @@
+From 2eb0f32dfe9f01f7992c7811b93496a425207398 Mon Sep 17 00:00:00 2001
+From: exploitizm <351399878+exploitizm@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 13:18:48 +1000
+Subject: [PATCH 5/8] radv/ps5: the stall dump traces the packets around the
+ stop and the last emulated task draw
+
+Diagnostics for a task+mesh hang (Ocarina of Time on Eden): the stall dump
+named the wait the GPU stopped at, a CB/DB end-of-pipe flush after an emulated
+task draw's last chunk, but not what lay between it and the last wait passed.
+Now it prints every packet from that wait to a little past the stop, and
+the task emulation's state at its last draw: its rings' entries and payload
+stride, whether the mesh shader exports in parts and publishes, the queries
+active, and the records, draw ring and payload as memory holds them now.
+radv_task_emu_begin also says the same, for its first eight draws.
+---
+ src/amd/vulkan/radv_cmd_buffer.c            | 36 ++++++++
+ src/amd/vulkan/winsys/ps5/radv_ps5_winsys.c | 94 +++++++++++++++++++++
+ 2 files changed, 130 insertions(+)
+
+diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
+index 7222622..89c8e8d 100644
+--- a/src/amd/vulkan/radv_cmd_buffer.c
++++ b/src/amd/vulkan/radv_cmd_buffer.c
+@@ -15431,6 +15431,14 @@ struct radv_task_emu {
+    uint64_t draw_ring_va;
+ };
+ 
++#ifdef RADV_PS5
++#include <inttypes.h>
++#include <stdio.h>
++#include "util/u_atomic.h"
++/* radv_ps5_winsys.c: what its stall dump shows of the last emulated task draw. */
++extern uint64_t radv_ps5_task_emu_note[8];
++#endif
++
+ static bool
+ radv_task_emu_begin(struct radv_cmd_buffer *cmd_buffer, struct radv_task_emu *emu)
+ {
+@@ -15466,6 +15474,34 @@ radv_task_emu_begin(struct radv_cmd_buffer *cmd_buffer, struct radv_task_emu *em
+    emu->rings_va = radv_buffer_get_va(cmd_buffer->upload.upload_bo) + offset;
+ 
+    radv_cs_add_buffer(device->ws, cmd_buffer->cs->b, device->task_emu_bo);
++
++#ifdef RADV_PS5
++   {
++      const struct radv_shader *mesh = cmd_buffer->state.shaders[MESA_SHADER_MESH];
++      const bool publishes = mesh && radv_ms_publishes(&mesh->info);
++      uint64_t *const note = radv_ps5_task_emu_note;
++      note[1] = publishes ? radv_buffer_get_va(device->ms_publish_ring) : 0;
++      note[2] = emu->entries;
++      note[3] = stride;
++      note[4] = (mesh ? mesh->info.ms.prim_parts : 0xff) | (uint64_t)publishes << 8 |
++                (uint64_t)(mesh && mesh->info.ms.has_query) << 16 | (uint64_t)task->info.cs.has_query << 24;
++      note[5] = (uint64_t)(cmd_buffer->state.active_occlusion_queries & 0xffff) |
++                (uint64_t)(radv_get_num_pipeline_stat_queries(cmd_buffer) & 0xffff) << 16 |
++                (uint64_t)cmd_buffer->state.active_prims_gen_queries << 32;
++      note[6]++;
++      note[7] = mesh ? mesh->va : 0;
++      note[0] = va;
++      static uint32_t told;
++      if (told < 8 && p_atomic_inc_return(&told) <= 8)
++         fprintf(stderr,
++                 "radv/ps5 task-emu: entries %u stride %u mesh parts %u publishes %u mesh query %u task query %u"
++                 " occlusion %u stats %u prims-gen %u task 0x%" PRIx64 " mesh 0x%" PRIx64 " multiview 0x%x\n",
++                 emu->entries, stride, (unsigned)(note[4] & 0xff), publishes, (unsigned)((note[4] >> 16) & 1),
++                 (unsigned)task->info.cs.has_query, cmd_buffer->state.active_occlusion_queries,
++                 radv_get_num_pipeline_stat_queries(cmd_buffer), cmd_buffer->state.active_prims_gen_queries,
++                 task->va, note[7], cmd_buffer->state.render.view_mask);
++   }
++#endif
+    return true;
+ }
+ 
+diff --git a/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.c b/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.c
+index 03fb7a2..1d1da11 100644
+--- a/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.c
++++ b/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.c
+@@ -547,6 +547,74 @@ radv_ps5_dump_wait_state(const struct radv_ps5_stall_wait *w, bool reached, bool
+    }
+ }
+ 
++/* What the stall dump shows of the last emulated task draw (radv_cmd_buffer.c, radv_task_emu_begin):
++ * [0] the task emulation buffer, [1] the publish ring (0 when the mesh shader does not publish),
++ * [2] ring entries, [3] payload stride, [4] mesh prim_parts | publishes << 8 | mesh has_query << 16 |
++ * task has_query << 24, [5] occlusion | pipeline-stat << 16 | prims-gen << 32 queries active,
++ * [6] task draws recorded, [7] mesh shader address. */
++uint64_t radv_ps5_task_emu_note[8];
++
++static void
++radv_ps5_dump_words(const char *what, uint64_t va, uint32_t dwords)
++{
++   for (uint32_t k = 0; k < dwords; k += 8) {
++      fprintf(stderr, "radv/ps5 stall: %s +0x%03x:", what, k * 4);
++      for (uint32_t j = k; j < k + 8 && j < dwords; j++) {
++         uint32_t v;
++         if (radv_ps5_stall_read(va + 4 * j, &v))
++            fprintf(stderr, " %08x", v);
++         else
++            fprintf(stderr, " ????????");
++      }
++      fprintf(stderr, "\n");
++   }
++}
++
++static void
++radv_ps5_dump_task_emu(void)
++{
++   const uint64_t *const t = radv_ps5_task_emu_note;
++   if (!t[0])
++      return;
++   fprintf(stderr,
++           "radv/ps5 stall: task emulation: bo 0x%" PRIx64 " publish ring 0x%" PRIx64 " entries %" PRIu64
++           " stride %" PRIu64 " mesh parts %u publishes %u mesh query %u task query %u; queries occlusion %u"
++           " stats %u prims-gen %u; %" PRIu64 " task draws; mesh 0x%" PRIx64 "\n",
++           t[0], t[1], t[2], t[3], (unsigned)(t[4] & 0xff), (unsigned)((t[4] >> 8) & 0xff),
++           (unsigned)((t[4] >> 16) & 0xff), (unsigned)((t[4] >> 24) & 0xff), (unsigned)(t[5] & 0xffff),
++           (unsigned)((t[5] >> 16) & 0xffff), (unsigned)(t[5] >> 32), t[6], t[7]);
++   radv_ps5_dump_words("records", t[0] /* RADV_TASK_EMU_RECORDS_OFFSET */, 2 * 16);
++   radv_ps5_dump_words("draw ring", t[0] + 65536u * 64u /* RADV_TASK_EMU_DRAW_RING_OFFSET */, 4 * 4);
++   radv_ps5_dump_words("payload", t[0] + 65536u * 64u + 65536u * 16u /* RADV_TASK_EMU_PAYLOAD_OFFSET */,
++                       t[3] ? (uint32_t)MIN2(t[3] / 4 * 2, 64) : 16);
++   if (t[1])
++      radv_ps5_dump_words("publish headers", t[1], 16);
++   fflush(stderr);
++}
++
++/* Every packet from the last wait the GPU passed to a little past where it stopped: opcode, length
++ * and the first body dwords. */
++static void
++radv_ps5_dump_packets(const uint32_t *words, uint32_t count, uint32_t from, uint32_t to)
++{
++   uint32_t at = 0, op, n, shown = 0;
++   fprintf(stderr, "radv/ps5 stall: packets from dword %u to %u:\n", from, to);
++   for (; at < count && at <= to && radv_ps5_stall_packet(words, count, at, &op, &n); at += n) {
++      if (at < from || op == UINT32_MAX)
++         continue;
++      if (++shown > 400) {
++         fprintf(stderr, "radv/ps5 stall:   ...\n");
++         break;
++      }
++      const char *name = radv_ps5_pkt3_name(op);
++      fprintf(stderr, "radv/ps5 stall:   @%u op 0x%02x %s n=%u:", at, op, name ? name : "", n);
++      for (uint32_t k = 1; k < n && k <= 8; k++)
++         fprintf(stderr, " %08x", words[at + k]);
++      fprintf(stderr, "%s\n", n > 9 ? " ..." : "");
++   }
++   fflush(stderr);
++}
++
+ /* The stuck submission, packet by packet: the waits it carries and what each reads now, the first
+  * whose condition does not hold (where the in-order GPU stopped), the last draws and dispatches
+  * before it with the program each runs, and whose code that is. */
+@@ -805,6 +873,32 @@ radv_ps5_dump_stuck(const uint32_t *words, uint32_t count, uint64_t seq)
+    if (wait_total + cond_total > lines)
+       fprintf(stderr, "radv/ps5 stall:   (%u more not shown)\n", wait_total + cond_total - lines);
+    fflush(stderr);
++
++   /* The waits around the stop, then every packet since the last wait the GPU passed. */
++   uint32_t from = 0;
++   if (stop_wait >= 0) {
++      const uint32_t first = stop_wait > 3 ? (uint32_t)stop_wait - 3 : 0;
++      for (uint32_t k = first; k < wait_count && k <= (uint32_t)stop_wait + 2; k++) {
++         const struct radv_ps5_stall_wait *const w = &waits[k];
++         fprintf(stderr, "radv/ps5 stall:   near the stop, %s %u at dword %u: ", w->number ? "wait" : "cond",
++                 w->number, w->at);
++         radv_ps5_dump_wait_text(w);
++         fprintf(stderr, ": ");
++         radv_ps5_dump_wait_state(w, (int)k <= stop_wait, (int)k == stop_wait);
++      }
++      for (int k = stop_wait - 1; k >= 0; k--) {
++         if (waits[k].op == PKT3_WAIT_REG_MEM) {
++            from = waits[k].at;
++            break;
++         }
++      }
++      if (stop - from > 6000)
++         from = stop - 6000;
++   } else {
++      from = parsed > 2000 ? parsed - 2000 : 0;
++   }
++   radv_ps5_dump_packets(words, count, from, stop + 64);
++   radv_ps5_dump_task_emu();
+ }
+ 
+ static void
+-- 
+2.53.0
+

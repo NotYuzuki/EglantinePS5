@@ -1,0 +1,38 @@
+From bf81723ba64afa0d2775ce36498d525625f0f578 Mon Sep 17 00:00:00 2001
+From: Oliv3rmoon <oliv3rmoon@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 12:46:08 -0700
+Subject: [PATCH] radv/ps5: RADV's shader cache on disk stays on whichever user
+ the app runs as.
+
+Mesa turns its disk cache off when the effective user or group differs from the real one: on a
+desktop that is a setuid program, which must not write a cache the real user owns. On the
+console it is what an elevated app looks like when a jailbreak changes only some of its ids, and
+there the cache is the app's own folder (MESA_SHADER_CACHE_DIR, headless/main.cpp). Without the
+cache every pipeline a game has is compiled again at every start, which for a game with many
+shaders is minutes of loading each time. Applied to the driver checkout after
+patch-radv-gs-compute.py; running it again changes nothing.
+
+From Nightshade tools/patch-radv-disk-cache.py.
+---
+ src/util/disk_cache_os.c | 5 ++---
+ 1 file changed, 2 insertions(+), 3 deletions(-)
+
+diff --git a/src/util/disk_cache_os.c b/src/util/disk_cache_os.c
+index eefa2d5..150c3ad 100644
+--- a/src/util/disk_cache_os.c
++++ b/src/util/disk_cache_os.c
+@@ -1030,9 +1030,8 @@ disk_cache_generate_cache_dir(void *mem_ctx, const char *gpu_name,
+ bool
+ disk_cache_enabled()
+ {
+-   /* If running as a users other than the real user disable cache */
+-   if (!__normal_user())
+-      return false;
++   /* ProsperoEden: the console app's ids may differ after elevation; its cache folder is its
++    * own, so the cache stays on (tools/patch-radv-disk-cache.py). */
+ 
+    /* At user request, disable shader cache entirely.
+     * Disk cache is not enabled by default for android, for most
+-- 
+2.53.0
+

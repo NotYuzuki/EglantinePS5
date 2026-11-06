@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 import pathlib
+import runpy
 import shutil
 import subprocess
 import sys
@@ -47,6 +48,10 @@ def items(names=()):
 
 def location(item):
     key = {'git': 'path', 'files': 'dest'}.get(item['kind'])
+    # The driver checkouts sit in their own folder when one is chosen (tools/radv_refs.py).
+    if key == 'path' and item[key].startswith('../mihawk-'):
+        refs = runpy.run_path(str(ROOT / 'tools/radv_refs.py'))['radv_refs'](ROOT)
+        return (refs / item[key][3:]).resolve()
     return (ROOT / item[key]).resolve() if key else (ROOT / item['creates']).resolve()
 
 

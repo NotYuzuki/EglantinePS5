@@ -1,0 +1,87 @@
+From 1b8b30db401f95c14559e2011132281694e62f75 Mon Sep 17 00:00:00 2001
+From: exploitizm <351399878+exploitizm@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 10:52:09 +1000
+Subject: [PATCH 4/8] radv/ps5: the stall dump on request, for a hang no marker
+ wait sees
+
+radv_ps5_queue_wait_seq dumps a stalled submission only while a thread polls
+its marker. In a hang where the submitting thread is blocked in
+sceAgcDriverSubmitDcb and every other thread waits on a Vulkan semaphore,
+nothing polls and the dump never ran (EglantinePS5, Ocarina of Time's task and
+mesh draws, 2026-11-06).
+
+The winsys now offers radv_ps5_dump_stall_now through a function pointer the
+application defines (eden_radv_stall_dump, weak here): it dumps when the oldest
+submission still in flight has not completed, as the ten-second check would,
+and never creates the queue. EglantinePS5's hang watch calls it before writing
+its hang report.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/amd/vulkan/winsys/ps5/radv_ps5_winsys.c | 36 +++++++++++++++++++++
+ 1 file changed, 36 insertions(+)
+
+diff --git a/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.c b/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.c
+index dda70f8..03fb7a2 100644
+--- a/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.c
++++ b/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.c
+@@ -26,6 +26,7 @@
+ /* ------------------------------------------------------------------ queue */
+ 
+ static struct radv_ps5_queue radv_ps5_queue_storage;
++static void radv_ps5_offer_stall_dump(void);
+ static struct radv_ps5_queue *radv_ps5_queue_instance;
+ static once_flag radv_ps5_queue_once = ONCE_FLAG_INIT;
+ 
+@@ -50,6 +51,7 @@ radv_ps5_queue_create(void)
+    mtx_init(&queue->sync_lock, mtx_plain);
+    cnd_init(&queue->sync_cond);
+    radv_ps5_queue_instance = queue;
++   radv_ps5_offer_stall_dump();
+ }
+ 
+ struct radv_ps5_queue *
+@@ -894,6 +896,40 @@ radv_ps5_queue_wait_seq(struct radv_ps5_queue *queue, uint64_t seq, uint64_t abs
+    }
+ }
+ 
++/* EglantinePS5: the stall dump when the app's hang watch sees no frame for a while
++ * (headless/crash_report.cpp, eden_radv_stall_dump). radv_ps5_queue_wait_seq's ten-second check
++ * runs only while a thread polls a submission's marker; a hang where the submitting thread is
++ * blocked in sceAgcDriverSubmitDcb and every other thread waits on a Vulkan semaphore never reaches
++ * it, and said nothing. Dumps when the oldest submission still in flight has not completed, as
++ * that check would; the dump itself runs once per process and is lock-free. Never creates the
++ * queue. */
++static void
++radv_ps5_dump_stall_now(void)
++{
++   struct radv_ps5_queue *const queue = p_atomic_read(&radv_ps5_queue_instance);
++   if (!queue)
++      return;
++   const uint64_t completed = radv_ps5_queue_poll(queue);
++   const uint64_t submitted = p_atomic_read(&queue->submitted_seq);
++   if (completed >= submitted) {
++      fprintf(stderr, "radv/ps5: stall dump asked: the GPU has run every submission (%" PRIu64 ")\n", completed);
++      return;
++   }
++   fprintf(stderr, "radv/ps5: stall dump asked: the GPU has run submission %" PRIu64 " of %" PRIu64 "\n", completed,
++           submitted);
++   radv_ps5_dump_stall(queue, completed + 1, completed);
++}
++
++/* The app's hook for it: a pointer the app defines (weak here, so a program without it links). */
++extern void (*eden_radv_stall_dump)(void) __attribute__((weak));
++
++static void
++radv_ps5_offer_stall_dump(void)
++{
++   if (&eden_radv_stall_dump)
++      p_atomic_set(&eden_radv_stall_dump, radv_ps5_dump_stall_now);
++}
++
+ /* ----------------------------------------------------------- the GPU itself */
+ 
+ /* The console's GPU as the winsys describes it to RADV, in the form the amdgpu
+-- 
+2.53.0
+

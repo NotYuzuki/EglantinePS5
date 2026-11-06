@@ -33,6 +33,16 @@ static atomic_flag eden_direct_lock = ATOMIC_FLAG_INIT;
 static int64_t eden_direct_floor;                 /* the lowest block taken at the top; 0: none yet */
 static int64_t eden_direct_holes[1024];           /* 2 MiB blocks given back above the floor */
 static unsigned eden_direct_hole_count;
+/* Memory given back since the app began: every release goes through the wrap below. A request
+ * eden_direct_high could not place anywhere is refused at once, with the same result, until some
+ * memory is given back: it searched up to 512 places of the pool for each size it was asked,
+ * under the heap's growth lock, so a heap filling holes in a pool with no room spent about a
+ * second a thread before it was refused. Nothing can fit after that until something is given
+ * back (others only take). The smallest size refused is kept; a smaller request still searches. */
+static atomic_ullong eden_direct_released;
+static int64_t eden_direct_refused_bytes;          /* 0: none since the last release */
+static unsigned long long eden_direct_refused_at;
+static int eden_direct_refused_result;
 
 static void eden_direct_acquire(void) {
   while (atomic_flag_test_and_set_explicit(&eden_direct_lock, memory_order_acquire)) {}
@@ -45,6 +55,12 @@ int eden_direct_high(size_t size, size_t alignment, int type, int64_t *start) {
   const int64_t bytes = (int64_t)size;
   if (bytes <= 0 || total <= 0) return __real_sceKernelAllocateDirectMemory(0, total, size, alignment, type, start);
   eden_direct_acquire();
+  const unsigned long long released = atomic_load_explicit(&eden_direct_released, memory_order_acquire);
+  if (eden_direct_refused_bytes != 0 && bytes >= eden_direct_refused_bytes && released == eden_direct_refused_at) {
+    const int refused = eden_direct_refused_result;
+    eden_direct_release();
+    return refused;
+  }
   /* A block given back earlier left a hole of its size. */
   while (size == EDEN_DIRECT_SMALL && eden_direct_hole_count != 0) {
     const int64_t hole = eden_direct_holes[--eden_direct_hole_count];
@@ -52,6 +68,14 @@ int eden_direct_high(size_t size, size_t alignment, int type, int64_t *start) {
       eden_direct_release();
       return 0;
     }
+  }
+  /* Room the top has again (the heap gives back empty pieces, arena slots and the pages of its
+   * free runs, headless/heap_arenas.inc): the lowest that fits above the floor, so the top is
+   * used again before it grows down into the middle of the pool. */
+  if (eden_direct_floor != 0 &&
+      __real_sceKernelAllocateDirectMemory(eden_direct_floor, total, size, alignment, type, start) == 0) {
+    eden_direct_release();
+    return 0;
   }
   /* Below what is at the top already; past what something else has put there, for a while. */
   int64_t next = eden_direct_floor != 0 ? eden_direct_floor : total;
@@ -64,8 +88,29 @@ int eden_direct_high(size_t size, size_t alignment, int type, int64_t *start) {
       return 0;
     }
   }
+  const int anywhere = __real_sceKernelAllocateDirectMemory(0, total, size, alignment, type, start);
+  if (anywhere != 0 && (eden_direct_refused_bytes == 0 || released != eden_direct_refused_at ||
+                        bytes < eden_direct_refused_bytes)) {
+    eden_direct_refused_bytes = bytes;
+    eden_direct_refused_at = released;
+    eden_direct_refused_result = anywhere;
+  }
   eden_direct_release();
-  return __real_sceKernelAllocateDirectMemory(0, total, size, alignment, type, start);
+  return anywhere;
+}
+
+/* Room the top has again, above the lowest block taken there (the heap's pieces, arena slots
+ * and holes it gave back): the lowest that fits. Nothing when the top has no such room; the
+ * caller asks for less, then below the floor (eden_direct_high). */
+int eden_direct_top_room(size_t size, size_t alignment, int type, int64_t *start) {
+  const int64_t total = sceKernelGetDirectMemorySize();
+  if (total <= 0) return -1;
+  eden_direct_acquire();
+  const int result = eden_direct_floor != 0
+                         ? __real_sceKernelAllocateDirectMemory(eden_direct_floor, total, size, alignment, type, start)
+                         : -1;
+  eden_direct_release();
+  return result;
 }
 
 /* As the system places it: for what a session takes and gives back. */
@@ -108,6 +153,7 @@ int __wrap_sceKernelAllocateDirectMemory(int64_t from, int64_t to, size_t size, 
 int __wrap_sceKernelReleaseDirectMemory(int64_t start, size_t size) {
   const int result = __real_sceKernelReleaseDirectMemory(start, size);
   if (result != 0) return result;
+  atomic_fetch_add_explicit(&eden_direct_released, 1, memory_order_release);
   eden_direct_acquire();
   if (size == EDEN_DIRECT_SMALL && eden_direct_floor != 0 && start >= eden_direct_floor &&
       eden_direct_hole_count < sizeof(eden_direct_holes) / sizeof(eden_direct_holes[0]))

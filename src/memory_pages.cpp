@@ -300,6 +300,8 @@ SparseRange* SparseRangeOf(std::uintptr_t address) {
 // From as high in the pool as there is room (src/direct_memory.c): what is committed this way,
 // the heap's pieces, stays for good, while a game's memory and its graphics come and go below.
 extern "C" int eden_direct_high(std::size_t size, std::size_t alignment, int type, std::int64_t* start);
+// The room the top has again (what the heap gave back there), lowest first; -1: none that large.
+extern "C" int eden_direct_top_room(std::size_t size, std::size_t alignment, int type, std::int64_t* start);
 // Where the system puts it: a 2 MiB block of this file's, which a session gives back.
 extern "C" int eden_direct_low(std::size_t size, std::size_t alignment, int type, std::int64_t* start);
 #endif
@@ -757,6 +759,12 @@ bool CommitMemoryRange(void* address, std::size_t size) noexcept {
     return CommitMemoryRangeFrom(address, size, true);
 }
 
+#ifdef PS5_NATIVE
+namespace {
+int ReserveOver(void* at, std::size_t length) noexcept;
+} // namespace
+#endif
+
 // `high`: from the top of the pool (memory that stays: the heap's pieces), else from where the
 // system places it (memory a session gives back: a large block).
 bool CommitMemoryRangeFrom(void* address, std::size_t size, bool high) noexcept {
@@ -767,12 +775,23 @@ bool CommitMemoryRangeFrom(void* address, std::size_t size, bool high) noexcept 
     const auto begin = reinterpret_cast<std::uintptr_t>(address);
     std::size_t done = 0, block = size;
     unsigned blocks = 0;
+    // Memory that stays first fills the room the top has again, in blocks as large as it has
+    // (the heap gives back pieces and the pages of its free runs there): taken below it instead, the
+    // top would stay full of holes and the heap grow down into the middle of the pool, where the
+    // graphics' large blocks need one run. Then, as before, as high as there is room.
+    bool top_room = high;
     while (done < size) {
         block = std::min(block, size - done);
         std::int64_t physical = -1;
-        const int taken = high ? eden_direct_high(block, LargePage, 12, &physical)
-                               : eden_direct_low(block, LargePage, 12, &physical);
+        const int taken = top_room ? eden_direct_top_room(block, LargePage, 12, &physical)
+                          : high   ? eden_direct_high(block, LargePage, 12, &physical)
+                                   : eden_direct_low(block, LargePage, 12, &physical);
         if (taken != 0) {
+            if (top_room && block == LargePage) {
+                top_room = false;  // none left up there: anywhere at the top, the whole rest at once
+                block = size - done;
+                continue;
+            }
             if (block == LargePage) break;  // not even one large page left
             block = std::max(LargePage, block / 2 / LargePage * LargePage);
             continue;
@@ -784,12 +803,8 @@ bool CommitMemoryRangeFrom(void* address, std::size_t size, bool high) noexcept 
             break;
         }
         if (!RecordCommitted(begin + done, block, physical)) {
-            // No entry left to give it back with: unmap it now, keeping the address space.
-            if (munmap(at, block) == 0) {
-                void* again = at;
-                (void)sceKernelReserveVirtualRange(&again, block, MAP_FIXED, LargePage);
-                (void)sceKernelReleaseDirectMemory(physical, block);
-            }
+            // No entry left to give it back with: given back now, keeping the address space.
+            if (ReserveOver(at, block) != 0) (void)sceKernelReleaseDirectMemory(physical, block);
             break;
         }
         done += block;
@@ -818,6 +833,31 @@ bool CommitMemoryRangeFrom(void* address, std::size_t size, bool high) noexcept 
 // other mapping can land there). 1: given back; 0: nothing was done (the range stays as it was);
 // -1: given back in part (the range must not be used again). dev-settings heap_return=off keeps
 // everything (0).
+//
+// The part may be a whole piece of the heap, with holes in it already given back, or a hole: the
+// large pages inside a free run of a piece or an arena (headless/heap_arenas.inc), which lie
+// inside one block of direct memory committed with the rest. Such a block gives back that part
+// of its memory and keeps the rest, in one entry or, when the part is in its middle, two. If the
+// system will not release part of a block, the part is mapped back as it was and no part is
+// given back this way again (the heap then keeps its free runs, as before).
+namespace {
+std::atomic<bool> partial_release_refused{false};
+// Turns a mapping into reserved address space. Asked to reserve over the mapping with MAP_FIXED,
+// the system replaces it in one call, so no other thread's mapping can land in between (unmapped
+// first and reserved after, a mapping made in the gap would be overwritten by the reservation).
+// Where it will not, the mapping is unmapped and the range reserved again, as before.
+// 1: reserved; 0: nothing changed (still mapped); -1: unmapped but not reserved again.
+#ifdef PS5_NATIVE
+int ReserveOver(void* at, std::size_t length) noexcept {
+    void* over = at;
+    if (sceKernelReserveVirtualRange(&over, length, MAP_FIXED, LargePage) == 0 && over == at) return 1;
+    if (munmap(at, length) != 0) return 0;
+    void* again = at;
+    return sceKernelReserveVirtualRange(&again, length, MAP_FIXED, LargePage) == 0 && again == at ? 1 : -1;
+}
+#endif
+} // namespace
+
 int DecommitMemoryRange(void* address, std::size_t size) noexcept {
     if (address == nullptr || size == 0) return 0;
 #ifdef PS5_NATIVE
@@ -825,27 +865,77 @@ int DecommitMemoryRange(void* address, std::size_t size) noexcept {
     if (kept) return 0;
     const auto begin = reinterpret_cast<std::uintptr_t>(address);
     const auto end = begin + size;
-    int result = 1;
-    std::size_t covered = 0;
+    bool done = false, failed = false, skipped = false;
     LockCommitted();
-    for (auto& block : committed_blocks) {
-        if (block.address < begin || block.address >= end || block.address == 0) continue;
-        void* at = reinterpret_cast<void*>(block.address);
-        // As the guest's memory gives a block back (src/host_memory.cpp): unmapped, the address
-        // space reserved again at once, then the memory released.
-        if (munmap(at, block.size) != 0) {
-            result = -1;
+    for (std::size_t index = 0; index < MostCommittedBlocks; ++index) {
+        CommittedBlock& block = committed_blocks[index];
+        if (block.address == 0) continue;
+        const std::uintptr_t block_end = block.address + block.size;
+        if (block_end <= begin || block.address >= end) continue;
+        const std::uintptr_t from = std::max(block.address, begin), to = std::min(block_end, end);
+        void* at = reinterpret_cast<void*>(from);
+        if (from == block.address && to == block_end) {
+            // Its address space reserved over the mapping, then the memory released.
+            const int reserved = ReserveOver(at, block.size);
+            if (reserved == 0) {
+                failed = true;
+                continue;
+            }
+            if (reserved < 0) failed = true;
+            if (sceKernelReleaseDirectMemory(block.physical, block.size) != 0) failed = true;
+            done = true;
+            block = CommittedBlock{};
             continue;
         }
-        void* again = at;
-        if (sceKernelReserveVirtualRange(&again, block.size, MAP_FIXED, LargePage) != 0 || again != at) result = -1;
-        if (sceKernelReleaseDirectMemory(block.physical, block.size) != 0) result = -1;
-        covered += block.size;
-        block = CommittedBlock{};
+        // Part of a block.
+        if (from % LargePage != 0 || to % LargePage != 0 ||
+            partial_release_refused.load(std::memory_order_relaxed)) {
+            skipped = true;
+            continue;
+        }
+        CommittedBlock* tail = nullptr;
+        if (from > block.address && to < block_end) {
+            for (std::size_t other = 0; other < MostCommittedBlocks && tail == nullptr; ++other)
+                if (other != index && committed_blocks[other].address == 0) tail = &committed_blocks[other];
+            if (tail == nullptr) {
+                skipped = true; // no entry for the rest after the part
+                continue;
+            }
+        }
+        const std::size_t length = to - from;
+        const std::int64_t physical = block.physical + static_cast<std::int64_t>(from - block.address);
+        const int over = ReserveOver(at, length);
+        if (over == 0) {
+            skipped = true;
+            continue;
+        }
+        const bool reserved = over > 0;
+        if (sceKernelReleaseDirectMemory(physical, length) != 0) {
+            // The system keeps part of a block: map it back where it was.
+            void* back = at;
+            if (sceKernelMapDirectMemory(&back, length, PROT_READ | PROT_WRITE, MAP_FIXED, physical, LargePage) != 0 ||
+                back != at) {
+                failed = true;
+            } else {
+                skipped = true;
+            }
+            if (!partial_release_refused.exchange(true, std::memory_order_relaxed))
+                Note("EDEN_HEAP_HOLE the system keeps part of a block: free runs stay in the heap\n");
+            continue;
+        }
+        if (!reserved) failed = true;
+        const CommittedBlock whole = block;
+        if (tail != nullptr) *tail = CommittedBlock{to, block_end - to, whole.physical + static_cast<std::int64_t>(to - whole.address)};
+        if (from == whole.address) {
+            block = CommittedBlock{to, block_end - to, whole.physical + static_cast<std::int64_t>(to - whole.address)};
+        } else {
+            block.size = from - whole.address;
+        }
+        done = true;
     }
     UnlockCommitted();
-    if (covered != size) result = covered == 0 ? 0 : -1;
-    return result;
+    if (failed || (done && skipped)) return -1;
+    return done ? 1 : 0;
 #else
     void* at = mmap(address, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE, -1, 0);
     return at == address ? 1 : 0;

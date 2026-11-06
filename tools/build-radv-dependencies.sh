@@ -2,7 +2,9 @@
 # Build isolated, pinned RADV dependencies; never deploy or replace the old SDK.
 set -euo pipefail
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-refs=$(dirname "$root")
+# The folder of the three checkouts (tools/radv-refs.sh: EDEN_RADV_REFS, .local/radv-refs).
+source "$root/tools/radv-refs.sh"
+refs=$(eden_radv_refs)
 export PS5_MESA_FORK="$refs/mihawk-mesa-review"
 export PS5_PAYLOAD_SDK_FORK="$refs/mihawk-sdk-review"
 vulkan="$refs/mihawk-vulkan-review"
@@ -15,6 +17,8 @@ for check in "ps5-vulkan-tools $vulkan" "ps5-mesa $PS5_MESA_FORK" "ps5-payload-s
 done
 # 24 parallel jobs unless RADV_BUILD_JOBS says otherwise: hosted CI runners have a few cores
 # and too little memory for 24 compilers (.github/workflows/release.yml sets it).
+# The Mesa revision the recipe exports (tools/build-radv.sh reads it since PS5_Vulkan f410e67a024).
+export PS5_MESA_REVISION=$(pin ps5-mesa)
 jobs=${RADV_BUILD_JOBS:-24}
 [[ $jobs =~ ^[1-9][0-9]*$ ]] || { echo "RADV_BUILD_JOBS must be a positive number: $jobs" >&2; exit 2; }
 export BUILD_JOBS=$jobs CMAKE_BUILD_PARALLEL_LEVEL=$jobs

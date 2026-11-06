@@ -1,0 +1,40 @@
+From f22424314940e366f1a5e326041483a7c6c06234 Mon Sep 17 00:00:00 2001
+From: exploitizm <351399878+exploitizm@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 14:33:57 +1000
+Subject: [PATCH 6/8] ac/nir/ngg: mesh shaders get the GFX10 workaround for
+ fully culled workgroups
+
+GFX10 hangs when an NGG workgroup allocates no primitive
+(has_ngg_fully_culled_bug); the vertex and geometry shader paths export a
+culled primitive instead, but the mesh shader path passed false, as mesh
+shaders upstream run only on GFX10.3 and later. The PS5's GPU is GFX10 and
+runs them, and a mesh workgroup that culls all its primitives then hangs it:
+its waves end, but the end-of-pipe event after the draw never comes.
+
+Ocarina of Time (on Eden) hit it at its first task+mesh draws: in the stall
+dump, the mesh waves of the stuck draw had finished (a VS_PARTIAL_FLUSH and a
+marker behind it passed) and the GPU waited on the end-of-pipe fence.
+---
+ src/amd/common/nir/ac_nir_lower_ngg_mesh.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/src/amd/common/nir/ac_nir_lower_ngg_mesh.c b/src/amd/common/nir/ac_nir_lower_ngg_mesh.c
+index 1809ccb..053e1b3 100644
+--- a/src/amd/common/nir/ac_nir_lower_ngg_mesh.c
++++ b/src/amd/common/nir/ac_nir_lower_ngg_mesh.c
+@@ -721,7 +721,11 @@ ms_alloc_vertices_and_primitives(nir_builder *b, nir_def *num_vtx, nir_def *num_
+       num_prm = ms_part_prims(b, num_prm, s);
+       num_vtx = nir_imul_imm(b, num_prm, s->vertices_per_prim);
+    }
+-   ac_nir_ngg_alloc_vertices_and_primitives(b, num_vtx, num_prm, false);
++   /* GFX10 hangs when a workgroup allocates no primitive: such a workgroup
++    * exports a culled one instead, as the other NGG stages do. Mesh shaders
++    * meet it on GFX10 when a workgroup culls all its primitives.
++    */
++   ac_nir_ngg_alloc_vertices_and_primitives(b, num_vtx, num_prm, s->ac->has_ngg_fully_culled_bug);
+ }
+ 
+ static void
+-- 
+2.53.0
+

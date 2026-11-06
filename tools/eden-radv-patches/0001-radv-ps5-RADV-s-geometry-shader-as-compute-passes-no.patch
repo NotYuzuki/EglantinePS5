@@ -1,0 +1,57 @@
+From 1a17eee5dee1910b5311124cfaa0c3791176e831 Mon Sep 17 00:00:00 2001
+From: Oliv3rmoon <oliv3rmoon@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 12:46:07 -0700
+Subject: [PATCH 1/8] radv/ps5: RADV's geometry-shader-as-compute passes: no
+ null pointer for a dropped draw.
+
+A draw the GPU-side setup drops (its counts do not fit) left the vertex output, index, count and
+output index buffers at 0, and the passes that still ran read and wrote through them: a GPU page
+fault (seen in a game's first battle). They now start at a 256-byte sink, and the setup
+points them at its read-only sink when it drops the draw. Applied to the driver checkout after
+patch-radv-wsi.py; running it again changes nothing.
+
+From Nightshade tools/patch-radv-gs-compute.py.
+
+(cherry picked from commit 76c71a05f54c86a21b6a9988a258b69338151f2e)
+---
+ src/amd/vulkan/cl/radv_gs_compute.cl | 4 ++++
+ src/amd/vulkan/radv_cmd_buffer.c     | 8 ++++++++
+ 2 files changed, 12 insertions(+)
+
+diff --git a/src/amd/vulkan/cl/radv_gs_compute.cl b/src/amd/vulkan/cl/radv_gs_compute.cl
+index dd00d08..b58a4d9 100644
+--- a/src/amd/vulkan/cl/radv_gs_compute.cl
++++ b/src/amd/vulkan/cl/radv_gs_compute.cl
+@@ -86,6 +86,10 @@ radv_gs_compute_setup(global struct radv_gs_compute_setup *s)
+    if (!ok) {
+       vertex_count = 0;
+       instance_count = 0;
++      /* ProsperoEden: nothing must read through a null pointer when the draw is dropped. */
++      vp->output_buffer = (uintptr_t)block->ro_sink;
++      p->count_buffer = (global uint *)block->ro_sink;
++      p->output_index_buffer = (global uint *)block->ro_sink;
+    }
+ 
+    poly_vertex_params_set_draw(vp, vertex_count, instance_count);
+diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
+index 9bda3a8..3448120 100644
+--- a/src/amd/vulkan/radv_cmd_buffer.c
++++ b/src/amd/vulkan/radv_cmd_buffer.c
+@@ -14396,6 +14396,14 @@ radv_gs_compute_prepare(struct radv_cmd_buffer *cmd_buffer, const struct radv_gs
+    poly_vertex_params_init(vp, gsc->vs_outputs, wg_size);
+    poly_geometry_params_init(gp, mode, wg_size);
+ 
++   /* ProsperoEden: pointers the GPU fills in only for a draw that fits start at the sink, not 0
++    * (a dropped draw read them as 0 and faulted the GPU in a game's battles). */
++   const uint64_t null_sink = radv_gs_compute_upload(cmd_buffer, 256, NULL, NULL);
++   vp->output_buffer = null_sink;
++   vp->index_buffer = null_sink;
++   gp->count_buffer = (uint64_t)null_sink;
++   gp->output_index_buffer = (uint64_t)null_sink;
++
+    /* Primitives generated and written per stream count into the command
+     * buffer's counters, which queries sample. */
+    const uint64_t sink = radv_gs_compute_upload(cmd_buffer, 256, NULL, NULL);
+-- 
+2.53.0
+
