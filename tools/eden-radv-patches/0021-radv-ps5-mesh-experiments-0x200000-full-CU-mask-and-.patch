@@ -1,0 +1,112 @@
+From 4a7f51d56a9ee2518c67b15b7323c2a3d984d80b Mon Sep 17 00:00:00 2001
+From: exploitizm <351399878+exploitizm@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 18:03:33 +1000
+Subject: [PATCH] radv/ps5: mesh experiments 0x200000 (full CU mask) and
+ 0x400000 (one parameter export)
+
+0x400000: a mesh shader without parameters exports one constant parameter
+per vertex lane, and SPI_VS_OUT_CONFIG counts it (NO_PC_EXPORT clear), the
+fragment shader unchanged. 0x200000: mesh shaders get the full CU mask, for
+use with 0x80000 (no late alloc). Both suggested in a second opinion, after
+the late alloc and VERT_GRP_SIZE experiments changed nothing.
+---
+ src/amd/common/nir/ac_nir_lower_ngg_mesh.c | 11 ++++++++++-
+ src/amd/vulkan/radv_cmd_buffer.c           |  3 ++-
+ src/amd/vulkan/radv_physical_device.c      |  2 +-
+ src/amd/vulkan/radv_shader.c               |  8 +++++++-
+ 4 files changed, 20 insertions(+), 4 deletions(-)
+
+diff --git a/src/amd/common/nir/ac_nir_lower_ngg_mesh.c b/src/amd/common/nir/ac_nir_lower_ngg_mesh.c
+index 918a6f8..4f374b4 100644
+--- a/src/amd/common/nir/ac_nir_lower_ngg_mesh.c
++++ b/src/amd/common/nir/ac_nir_lower_ngg_mesh.c
+@@ -11,6 +11,7 @@
+ #include "nir_builder.h"
+ 
+ #ifdef RADV_PS5
++#include "amdgfxregs.h"
+ #include <math.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -26,7 +27,8 @@
+  * workgroups that start, and the waves that reach the finale and its end
+  * (ms_ps5_count), 0x20000 exports every position as (0, 0, 0, 1), 0x40000
+  * every primitive null, 0x100000 rounds the registers' mesh workgroup up to
+- * whole waves (radv_shader_info.c). The RADV cache UUID takes the mask too. */
++ * whole waves (radv_shader_info.c), 0x400000 exports one constant parameter
++ * from a shader without any. The RADV cache UUID takes the mask too. */
+ unsigned
+ ac_ps5_mesh_experiments(void)
+ {
+@@ -1102,6 +1104,13 @@ emit_ms_vertex(nir_builder *b, nir_def *index, nir_def *row, bool exports, bool
+                              &s->out, row);
+    }
+ 
++#ifdef RADV_PS5
++   /* Experiment 0x400000: a shader without parameters exports one, a constant, which
++    * SPI_VS_OUT_CONFIG then counts (radv_precompute_registers_hw_ngg). */
++   if (exports && parameters && !s->has_param_exports && (ac_ps5_mesh_experiments() & 0x400000))
++      nir_export_amd(b, nir_imm_zero(b, 4, 32), .target = V_008DFC_SQ_EXP_PARAM, .enabled_channels = 0xf);
++#endif
++
+    if (parameters) {
+       /* Export generic attributes when there is no attribute ring. */
+       if (s->has_param_exports && !s->ac->has_attr_ring) {
+diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
+index c05c8d6..d1ca4a6 100644
+--- a/src/amd/vulkan/radv_cmd_buffer.c
++++ b/src/amd/vulkan/radv_cmd_buffer.c
+@@ -15453,7 +15453,8 @@ extern uint64_t radv_ps5_task_emu_note[8];
+  * the mesh lowering (ac_ps5_mesh_experiments); 0x4000 leaves GE_CNTL.VERT_GRP_SIZE of mesh shaders
+  * out of GFX10's NGG workaround; 0x10000 leaves the records of task workgroups without mesh
+  * workgroups out of a chunk's mesh draw (radv_task_emu_compacts); 0x80000 gives mesh shaders no
+- * late alloc (radv_precompute_registers_hw_ngg). */
++ * late alloc, 0x200000 the full CU mask, 0x400000 a parameter export when they have none
++ * (radv_precompute_registers_hw_ngg). */
+ uint32_t
+ radv_ps5_task_emu_debug(void)
+ {
+diff --git a/src/amd/vulkan/radv_physical_device.c b/src/amd/vulkan/radv_physical_device.c
+index c33ecac..25fd3ca 100644
+--- a/src/amd/vulkan/radv_physical_device.c
++++ b/src/amd/vulkan/radv_physical_device.c
+@@ -395,7 +395,7 @@ radv_device_get_cache_uuid(struct radv_physical_device *pdev, void *uuid)
+ #ifdef RADV_PS5
+    {
+       /* The mesh lowering's experiments change the code (ac_ps5_mesh_experiments). */
+-      const unsigned experiments = ac_ps5_mesh_experiments() & 0x169b80;
++      const unsigned experiments = ac_ps5_mesh_experiments() & 0x569b80;
+       if (experiments)
+          _mesa_blake3_update(&ctx, &experiments, sizeof(experiments));
+    }
+diff --git a/src/amd/vulkan/radv_shader.c b/src/amd/vulkan/radv_shader.c
+index 26775db..c7770ff 100644
+--- a/src/amd/vulkan/radv_shader.c
++++ b/src/amd/vulkan/radv_shader.c
+@@ -1831,9 +1831,12 @@ radv_precompute_registers_hw_ngg(struct radv_device *device, struct radv_shader
+                                          S_00B220_WAVE_LIMIT(0x3ff) | S_00B220_INST_PREF_SIZE(inst_pref_size);
+    } else {
+       const unsigned num_params = MAX2(info->outinfo.param_exports, 1);
++      /* Experiment 0x400000: a mesh shader without parameters exports one (ac_ps5_mesh_experiments). */
++      const bool dummy_param = shader->info.stage == MESA_SHADER_MESH && no_pc_export &&
++                               (radv_ps5_task_emu_debug() & 0x400000);
+ 
+       regs->spi_vs_out_config = S_0286C4_VS_EXPORT_COUNT(num_params - 1) | S_0286C4_PRIM_EXPORT_COUNT(num_prim_params) |
+-                                S_0286C4_NO_PC_EXPORT(no_pc_export);
++                                S_0286C4_NO_PC_EXPORT(no_pc_export && !dummy_param);
+ 
+       unsigned late_alloc_wave64, cu_mask;
+       ac_compute_late_alloc(&pdev->info, true, info->has_ngg_culling, config->scratch_bytes_per_wave > 0,
+@@ -1841,6 +1844,9 @@ radv_precompute_registers_hw_ngg(struct radv_device *device, struct radv_shader
+       /* Experiment 0x80000 (radv_ps5_task_emu_debug): no late alloc for mesh shaders. */
+       if (shader->info.stage == MESA_SHADER_MESH && (radv_ps5_task_emu_debug() & 0x80000))
+          late_alloc_wave64 = 0;
++      /* Experiment 0x200000: mesh shaders on every CU (with 0x80000: no late alloc to mask for). */
++      if (shader->info.stage == MESA_SHADER_MESH && (radv_ps5_task_emu_debug() & 0x200000))
++         cu_mask = 0xffff;
+ 
+       regs->spi_shader_pgm_rsrc3_gs =
+          ac_apply_cu_en(S_00B21C_CU_EN(cu_mask) | S_00B21C_WAVE_LIMIT(0x3F), C_00B21C_CU_EN, 0, &pdev->info);
+-- 
+2.53.0
+
