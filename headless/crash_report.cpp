@@ -34,6 +34,12 @@ std::size_t eden_heap_large_held(unsigned* blocks);
 // The app's code, from the link (tools/unwind.ld).
 extern const char __eden_text_start[];
 extern const char __eden_text_end[];
+// The Vulkan driver's stall dump on request: RADV's winsys sets it when it creates its queue
+// (radv_ps5_winsys.c, radv_ps5_offer_stall_dump); null without RADV. The hang report calls it
+// first. Its own ten-second check runs only while a thread polls a submission's marker, and in
+// Ocarina of Time's hang none did (the submitting thread blocked in the kernel, the others on
+// Vulkan semaphores), so the driver said nothing about where the GPU stopped.
+void (*eden_radv_stall_dump)(void) = nullptr;
 }
 
 namespace Eden::Crash {
@@ -587,6 +593,8 @@ void PutStamp(Text<160 * 1024>& t, const Stamp& stamp) noexcept {
 }
 
 void WriteHangReport(unsigned seconds, unsigned long long frames) noexcept {
+    // What the GPU was stuck on, in stderr.log, before the threads are asked for their stacks.
+    if (const auto dump = __atomic_load_n(&eden_radv_stall_dump, __ATOMIC_ACQUIRE)) dump();
     const auto self = (std::uintptr_t)pthread_self();
     unsigned entries = 0, asked = 0, answered = 0;
     for (unsigned i = 0; i < kNamedThreads; ++i) {
