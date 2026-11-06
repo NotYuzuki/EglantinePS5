@@ -1,0 +1,107 @@
+From 42932a5f04fd6d1bb1eb5ba534945433a70085fb Mon Sep 17 00:00:00 2001
+From: exploitizm <351399878+exploitizm@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 15:15:10 +1000
+Subject: [PATCH] radv/ps5: mesh experiment 0x800, every workgroup allocates
+ and exports the most
+
+Run 15:13 (0x200): one null primitive in place of none does not help; the
+same draw hangs. 0x800 has every mesh workgroup allocate the shader's most
+vertices and primitives and export them all, the primitives past its own
+count null, to tell whether the counts matter at all.
+---
+ src/amd/common/nir/ac_nir_lower_ngg_mesh.c | 30 +++++++++++++++++++---
+ src/amd/vulkan/radv_physical_device.c      |  2 +-
+ 2 files changed, 28 insertions(+), 4 deletions(-)
+
+diff --git a/src/amd/common/nir/ac_nir_lower_ngg_mesh.c b/src/amd/common/nir/ac_nir_lower_ngg_mesh.c
+index 5112ddc..7f9f3e1 100644
+--- a/src/amd/common/nir/ac_nir_lower_ngg_mesh.c
++++ b/src/amd/common/nir/ac_nir_lower_ngg_mesh.c
+@@ -18,8 +18,9 @@
+  * from /data/eglantineps5/radv-task-emu.txt: 0x80 has every mesh workgroup
+  * allocate and export nothing, 0x100 keeps its vertices and primitives in
+  * its first wave, 0x200 has a workgroup that would allocate nothing
+- * allocate one vertex and one null primitive. The RADV cache UUID takes the
+- * mask too. */
++ * allocate one vertex and one null primitive, 0x800 has every workgroup
++ * allocate and export the most vertices and primitives, those past its own
++ * primitive count null. The RADV cache UUID takes the mask too. */
+ unsigned
+ ac_ps5_mesh_experiments(void)
+ {
+@@ -149,6 +150,9 @@ typedef struct
+    /* ac_ps5_mesh_experiments 0x200: the workgroup allocated one null
+     * primitive in place of none. */
+    nir_variable *null_prim_var;
++   /* ac_ps5_mesh_experiments 0x800: the workgroup's own primitive count,
++    * the primitives past it exported null. */
++   nir_variable *real_prm_var;
+    /* True if the output vertex and primitive counts are workgroup-uniform. */
+    bool output_counts_workgroup_uniform;
+ 
+@@ -757,6 +761,12 @@ ms_alloc_vertices_and_primitives(nir_builder *b, nir_def *num_vtx, nir_def *num_
+     * exports a culled one instead, as the other NGG stages do. Mesh shaders
+     * meet it on GFX10 when a workgroup culls all its primitives.
+     */
++#ifdef RADV_PS5
++   if ((ac_ps5_mesh_experiments() & 0x800) && !s->prim_parts) {
++      num_vtx = nir_imm_int(b, b->shader->info.mesh.max_vertices_out);
++      num_prm = nir_imm_int(b, b->shader->info.mesh.max_primitives_out);
++   }
++#endif
+    ac_nir_ngg_alloc_vertices_and_primitives(b, num_vtx, num_prm, s->ac->has_ngg_fully_culled_bug);
+ }
+ 
+@@ -783,7 +793,7 @@ set_ms_final_output_counts(nir_builder *b,
+       num_prm = nir_umin(b, num_prm, nir_imm_int(b, s->wave_size));
+       num_vtx = nir_umin(b, num_vtx, nir_imm_int(b, s->wave_size));
+    }
+-   if ((ac_ps5_mesh_experiments() & 0x200) && !s->prim_parts) {
++   if ((ac_ps5_mesh_experiments() & 0x200) && !(ac_ps5_mesh_experiments() & 0x800) && !s->prim_parts) {
+       /* No workgroup allocates nothing: one vertex and one null primitive instead. */
+       nir_def *none = nir_ieq_imm(b, num_prm, 0);
+       num_prm = nir_bcsel(b, none, nir_imm_int(b, 1), num_prm);
+@@ -937,6 +947,10 @@ ms_prim_exp_arg_ch1(nir_builder *b, nir_def *invocation_index, nir_def *num_vtx,
+       nir_def *null_prim = nir_load_var(b, s->null_prim_var);
+       cull_flag = cull_flag ? nir_ior(b, cull_flag, null_prim) : null_prim;
+    }
++   if (s->real_prm_var) {
++      nir_def *past = nir_uge(b, invocation_index, nir_load_var(b, s->real_prm_var));
++      cull_flag = cull_flag ? nir_ior(b, cull_flag, past) : past;
++   }
+ 
+    nir_def *indices[3];
+    nir_def *max_vtx_idx = nir_iadd_imm(b, num_vtx, -1u);
+@@ -1385,6 +1399,16 @@ emit_ms_finale(nir_builder *b, lower_ngg_ms_state *s)
+ 
+    set_ms_final_output_counts(b, s, &num_prm, &num_vtx);
+ 
++#ifdef RADV_PS5
++   if ((ac_ps5_mesh_experiments() & 0x800) && !s->prim_parts) {
++      /* Every workgroup exports all it allocated: the most of both. */
++      s->real_prm_var = nir_local_variable_create(b->impl, glsl_uint_type(), "ms_real_prm");
++      nir_store_var(b, s->real_prm_var, num_prm, 0x1);
++      num_prm = nir_imm_int(b, b->shader->info.mesh.max_primitives_out);
++      num_vtx = nir_imm_int(b, b->shader->info.mesh.max_vertices_out);
++   }
++#endif
++
+    nir_def *invocation_index = nir_load_local_invocation_index(b);
+ 
+    ms_prim_gen_query(b, invocation_index, num_prm, s);
+diff --git a/src/amd/vulkan/radv_physical_device.c b/src/amd/vulkan/radv_physical_device.c
+index 51f3bff..47d97f2 100644
+--- a/src/amd/vulkan/radv_physical_device.c
++++ b/src/amd/vulkan/radv_physical_device.c
+@@ -395,7 +395,7 @@ radv_device_get_cache_uuid(struct radv_physical_device *pdev, void *uuid)
+ #ifdef RADV_PS5
+    {
+       /* The mesh lowering's experiments change the code (ac_ps5_mesh_experiments). */
+-      const unsigned experiments = ac_ps5_mesh_experiments() & 0x380;
++      const unsigned experiments = ac_ps5_mesh_experiments() & 0xb80;
+       if (experiments)
+          _mesa_blake3_update(&ctx, &experiments, sizeof(experiments));
+    }
+-- 
+2.53.0
+
