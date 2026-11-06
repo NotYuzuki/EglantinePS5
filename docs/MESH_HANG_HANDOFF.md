@@ -127,8 +127,8 @@ echo .local/radv > .local/radv-refs
 ```
 
 `git am` gives new commit ids: put the new `eden-radv` head in `tools/deps.json` (`ps5-mesa`).
-**The `eden-radv` branch needs a public home before this can merge** (`tools/deps.json` names
-Mihawk's repo, which does not have it). Do not push without asking the user.
+The `eden-radv` branch lives in the fork `exploitizm/PS5_Mesa`, which `tools/deps.json` names;
+cloning that and checking out `eden-radv` replaces the `git am` above.
 
 To change the driver: edit and commit in `.local/radv/mihawk-mesa-review`, put the new commit in
 `tools/deps.json` (`ps5-mesa`), and rebuild; `tools/prepare-build.sh` rebuilds RADV when the
