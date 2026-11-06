@@ -1,4 +1,4 @@
-From 2473a5ac2498a570d1e2f2596dd8b0e9cee1e924 Mon Sep 17 00:00:00 2001
+From 771487d4ef08e1fbd10d009bc3382cc2fa746f0f Mon Sep 17 00:00:00 2001
 From: exploitizm <351399878+exploitizm@users.noreply.github.com>
 Date: Fri, 6 Nov 2026 14:49:32 +1000
 Subject: [PATCH] radv/ps5: task+mesh hang experiments 0x80 and 0x100 in the
@@ -9,11 +9,29 @@ never reaches end-of-pipe, after its mesh waves finished. 0x80: every mesh
 workgroup allocates and exports nothing; 0x100: its vertices and primitives
 stay in its first wave. The mask goes into the cache UUID.
 ---
+ src/amd/common/nir/ac_nir.h                |  6 ++++
  src/amd/common/nir/ac_nir_lower_ngg_mesh.c | 37 ++++++++++++++++++++++
  src/amd/vulkan/radv_cmd_buffer.c           |  3 +-
  src/amd/vulkan/radv_physical_device.c      | 10 ++++++
- 3 files changed, 49 insertions(+), 1 deletion(-)
+ 4 files changed, 55 insertions(+), 1 deletion(-)
 
+diff --git a/src/amd/common/nir/ac_nir.h b/src/amd/common/nir/ac_nir.h
+index a9fbd5f..9303db5 100644
+--- a/src/amd/common/nir/ac_nir.h
++++ b/src/amd/common/nir/ac_nir.h
+@@ -280,6 +280,12 @@ bool
+ ac_nir_lower_ngg_mesh(nir_shader *shader, const ac_nir_lower_ngg_options *options,
+                       bool *out_needs_scratch_ring);
+ 
++#ifdef RADV_PS5
++/* Task+mesh hang experiments on the PS5 (ac_nir_lower_ngg_mesh.c). */
++unsigned
++ac_ps5_mesh_experiments(void);
++#endif
++
+ bool
+ ac_nir_lower_task_outputs_to_mem(nir_shader *shader,
+                                  bool has_query);
 diff --git a/src/amd/common/nir/ac_nir_lower_ngg_mesh.c b/src/amd/common/nir/ac_nir_lower_ngg_mesh.c
 index 053e1b3..b7a1554 100644
 --- a/src/amd/common/nir/ac_nir_lower_ngg_mesh.c
@@ -84,17 +102,24 @@ index 7c17561..42b9c8d 100644
  radv_ps5_task_emu_debug(void)
  {
 diff --git a/src/amd/vulkan/radv_physical_device.c b/src/amd/vulkan/radv_physical_device.c
-index c0826e5..6a9d95e 100644
+index c0826e5..2badac9 100644
 --- a/src/amd/vulkan/radv_physical_device.c
 +++ b/src/amd/vulkan/radv_physical_device.c
-@@ -391,6 +391,16 @@ radv_device_get_cache_uuid(struct radv_physical_device *pdev, void *uuid)
+@@ -30,6 +30,7 @@
+ #include "radv_entrypoints.h"
+ #include "radv_instance.h"
+ #include "radv_physical_device.h"
++#include "nir/ac_nir.h"
+ #include "radv_pipeline_rt.h"
+ #include "radv_video.h"
+ #include "radv_wsi.h"
+@@ -391,6 +392,15 @@ radv_device_get_cache_uuid(struct radv_physical_device *pdev, void *uuid)
        return -1;
  #endif
  
 +#ifdef RADV_PS5
 +   {
 +      /* The mesh lowering's experiments change the code (ac_ps5_mesh_experiments). */
-+      extern unsigned ac_ps5_mesh_experiments(void);
 +      const unsigned experiments = ac_ps5_mesh_experiments() & 0x180;
 +      if (experiments)
 +         _mesa_blake3_update(&ctx, &experiments, sizeof(experiments));
