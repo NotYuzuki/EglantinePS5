@@ -127,10 +127,10 @@
     },
     {
       "name": "ps5-mesa",
-      "about": "Mihawk's PS5 Mesa (RADV) source: his main at f5610fe2709 with Belladonna's 76c71a05f54, 9d73715bd1a and 318deb146da (Oliv3rmoon/Belladonna), and the stall dump on request, on branch eden-radv",
+      "about": "Mihawk's PS5 Mesa (RADV) source: his main at f5610fe2709 with Belladonna's 76c71a05f54, 9d73715bd1a and 318deb146da (Oliv3rmoon/Belladonna), the stall dump on request, and its packet trace and task emulation state, on branch eden-radv",
       "kind": "git",
       "url": "https://github.com/mihawk-99/PS5_Mesa.git",
-      "commit": "1b8b30db401f95c14559e2011132281694e62f75",
+      "commit": "2eb0f32dfe9f01f7992c7811b93496a425207398",
       "path": "../mihawk-mesa-review"
     },
     {
