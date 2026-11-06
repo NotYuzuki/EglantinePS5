@@ -1,0 +1,136 @@
+From 6faf9824b98a62bceb8dc906185326047d152775 Mon Sep 17 00:00:00 2001
+From: exploitizm <351399878+exploitizm@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 07:58:17 +1000
+Subject: [PATCH] radv/ps5: mesh compute's buffer at 16 MiB, its empty passes
+ skipped
+
+Every chunk ran as many passes as 65536 mesh workgroups take, each a
+dispatch, a draw and their flushes, whatever the chunk held; so the slots
+had to be large (128 MiB) for the passes to be few.
+
+A pass past the chunk's mesh workgroups is now skipped by the command
+processor: a COND_EXEC on its dispatch's workgroup count, which the records
+pass writes. The first pass always runs, so the skipped ones' state is set
+already, and their flushes are events and cache invalidations only. With
+empty passes free, the slots are 16 MiB (a 16 KiB header holds up to 510
+passes' arguments). Each pipeline's slot size and pass capacity are logged
+once, for the first 16.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/amd/vulkan/radv_cmd_buffer.c   | 22 ++++++++++++++++++++++
+ src/amd/vulkan/radv_mesh_compute.c |  9 +++++++--
+ src/amd/vulkan/radv_mesh_compute.h | 14 +++++++++++---
+ 3 files changed, 40 insertions(+), 5 deletions(-)
+
+diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
+index fd4bf32..539f17d 100644
+--- a/src/amd/vulkan/radv_cmd_buffer.c
++++ b/src/amd/vulkan/radv_cmd_buffer.c
+@@ -15747,6 +15747,7 @@ radv_mesh_compute_chunk(struct radv_cmd_buffer *cmd_buffer, const struct radv_ta
+                         uint32_t draw_id, uint32_t count, uint64_t count_va)
+ {
+    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
++   const struct radv_physical_device *pdev = radv_device_physical(device);
+    const struct radv_pipeline *pipeline = &cmd_buffer->state.graphics_pipeline->base;
+    struct radv_cmd_stream *cs = cmd_buffer->cs;
+    const uint32_t capacity = pipeline->mesh_compute_capacity;
+@@ -15763,6 +15764,22 @@ radv_mesh_compute_chunk(struct radv_cmd_buffer *cmd_buffer, const struct radv_ta
+ 
+       /* The records pass, or the last pass's compute pass and copy, are done with the header. */
+       radv_emit_cache_flush(cmd_buffer);
++
++      /* A pass past the chunk's mesh workgroups (its dispatch's x 0) is skipped by the command
++       * processor. Its packets repeat the first pass's state, which always runs, and its flushes
++       * are events and cache invalidations only: skipping them leaves nothing waiting. They fit
++       * where they are reserved, so no chained buffer splits them. */
++      uint32_t cond_count = 0; /* the COND_EXEC's dword count, by index (0: none) */
++      uint32_t cond_start = 0;
++      if (pass > 0) {
++         assert(!(cmd_buffer->state.flush_bits & (RADV_CMD_FLAG_FLUSH_AND_INV_CB | RADV_CMD_FLAG_FLUSH_AND_INV_DB)));
++         radeon_check_space(device->ws, cs->b, RADV_MESH_COMPUTE_PASS_DWORDS);
++         ac_emit_cp_pfp_sync_me(cs->b, false);
++         ac_emit_cp_cond_exec(cs->b, pdev->info.gfx_level, args_va, 0);
++         cond_count = cs->b->cdw - 1;
++         cond_start = cs->b->cdw;
++      }
++
+       radeon_check_space(device->ws, cs->b, 16);
+       radv_cs_write_data(device, cs, V_371_MICRO_ENGINE, header_va + RADV_MESH_COMPUTE_HEADER_BASE, 1, &first, false);
+ 
+@@ -15777,6 +15794,11 @@ radv_mesh_compute_chunk(struct radv_cmd_buffer *cmd_buffer, const struct radv_ta
+       radeon_check_space(device->ws, cs->b, 64);
+       radv_emit_indirect_draw_packets(cmd_buffer, &rast);
+ 
++      if (cond_count) {
++         assert(cs->b->cdw > cond_start && cs->b->cdw - cond_start < RADV_MESH_COMPUTE_PASS_DWORDS);
++         cs->b->buf[cond_count] = cs->b->cdw - cond_start;
++      }
++
+       /* The next pass or chunk writes the header and the slots the copy reads, and the rings. */
+       cmd_buffer->state.flush_bits |= RADV_CMD_FLAG_VS_PARTIAL_FLUSH;
+    }
+diff --git a/src/amd/vulkan/radv_mesh_compute.c b/src/amd/vulkan/radv_mesh_compute.c
+index 46323b6..6cd80d7 100644
+--- a/src/amd/vulkan/radv_mesh_compute.c
++++ b/src/amd/vulkan/radv_mesh_compute.c
+@@ -434,11 +434,16 @@ radv_mesh_compute_split(const struct radv_compiler_info *compiler_info, struct r
+    l.max_primitives = mesh->info.mesh.max_primitives_out;
+    l.prim_offset = 16 + l.max_vertices * l.num_vtx_slots * 16;
+    l.stride = align(l.prim_offset + l.max_primitives * 4, 64);
+-   l.capacity = MIN2((RADV_MESH_COMPUTE_BYTES - RADV_MESH_COMPUTE_HEADER_BYTES) / l.stride,
+-                     RADV_MESH_COMPUTE_CHUNK_WORKGROUPS);
++   l.capacity = MIN2(RADV_MESH_COMPUTE_SLOTS_BYTES / l.stride, RADV_MESH_COMPUTE_CHUNK_WORKGROUPS);
+    l.payload_stride = align(MAX2(stages[MESA_SHADER_TASK].nir->info.task_payload_size, 16), 16);
+    l.address32_hi = compiler_info->hw.address32_hi;
+ 
++   static unsigned told;
++   if (p_atomic_inc_return(&told) <= 16)
++      fprintf(stderr,
++              "radv/ps5 mesh-compute: a slot of %u bytes (%u vertices of %u outputs, %u primitives), %u a pass\n",
++              l.stride, l.max_vertices, l.num_vtx_slots, l.max_primitives, l.capacity);
++
+    nir_shader *vs = build_copy_vs(mesh->options, &l, compiler_info->key.ge_wave_size);
+    lower_mesh_to_compute(mesh, &l);
+ 
+diff --git a/src/amd/vulkan/radv_mesh_compute.h b/src/amd/vulkan/radv_mesh_compute.h
+index 41540f6..aa70639 100644
+--- a/src/amd/vulkan/radv_mesh_compute.h
++++ b/src/amd/vulkan/radv_mesh_compute.h
+@@ -20,7 +20,9 @@
+  * that reads them. Per emulated task chunk: the task shader; the records pass
+  * (radv_meta_mesh_compute_records: a record a task workgroup, with the mesh workgroups before it);
+  * then per pass of up to capacity mesh workgroups, the compute pass (each workgroup finds its
+- * record by binary search) and a triangle-list draw of 3 vertices per primitive slot.
++ * record by binary search) and a triangle-list draw of 3 vertices per primitive slot. Passes
++ * past the chunk's mesh workgroups are skipped by the command processor (COND_EXEC on the pass's
++ * workgroup count).
+  *
+  * The device's buffer (RADV_MESH_COMPUTE_BYTES): a header, then the slots.
+  *
+@@ -33,14 +35,20 @@
+  * per-vertex outputs (16 bytes each, in the order of their varying slots), then max_primitives
+  * triangles (their three vertex indices, a byte each, in a dword). */
+ 
+-#define RADV_MESH_COMPUTE_BYTES          (128u << 20)
+-#define RADV_MESH_COMPUTE_HEADER_BYTES   4096u
++/* The slots: a pass holds as many mesh workgroups as fit, so a mesh shader with large outputs
++ * runs more passes, which cost nothing when empty. */
++#define RADV_MESH_COMPUTE_SLOTS_BYTES    (16u << 20)
++#define RADV_MESH_COMPUTE_HEADER_BYTES   16384u
++#define RADV_MESH_COMPUTE_BYTES          (RADV_MESH_COMPUTE_HEADER_BYTES + RADV_MESH_COMPUTE_SLOTS_BYTES)
+ #define RADV_MESH_COMPUTE_HEADER_BASE    0u  /* the pass's first mesh workgroup */
+ #define RADV_MESH_COMPUTE_HEADER_RECORDS 4u  /* the chunk's records, then its mesh workgroups */
+ #define RADV_MESH_COMPUTE_HEADER_PASSES  64u /* a pass's dispatch, then its draw */
+ #define RADV_MESH_COMPUTE_PASS_BYTES     32u
+ #define RADV_MESH_COMPUTE_MAX_PASSES                                                                \
+    ((RADV_MESH_COMPUTE_HEADER_BYTES - RADV_MESH_COMPUTE_HEADER_PASSES) / RADV_MESH_COMPUTE_PASS_BYTES)
++/* The most a pass's packets take (radv_mesh_compute_chunk), reserved so a skipped pass is one
++ * span of the command buffer. */
++#define RADV_MESH_COMPUTE_PASS_DWORDS 2048u
+ /* The mesh workgroups an emulated task chunk may have before the rest are left out. */
+ #define RADV_MESH_COMPUTE_CHUNK_WORKGROUPS 65536u
+ 
+-- 
+2.53.0
+

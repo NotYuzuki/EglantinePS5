@@ -36,9 +36,10 @@ Per emulated task chunk (`radv_mesh_compute_chunk`):
 2. The records pass (`radv_meta_mesh_compute_records`): one record per task workgroup, with its
    grid, its task draw and the count of mesh workgroups before it, then in the buffer's header
    the count of records and of mesh workgroups, and each pass's dispatch and draw arguments.
-3. Per pass of as many mesh workgroups as the slots hold (`capacity`, 128 MiB over the
+3. Per pass of as many mesh workgroups as the slots hold (`capacity`, 16 MiB over the
    workgroup's slot size, at most 65536), the command processor writes the pass's first mesh
-   workgroup to the header, then:
+   workgroup to the header, then (a pass past the chunk's mesh workgroups is skipped by the
+   command processor, a COND_EXEC on its dispatch's workgroup count):
    - the mesh shader as compute, DISPATCH_INDIRECT over the pass's workgroups. Each one finds its
      task workgroup's record by binary search, and writes a slot: its vertex and primitive
      counts, its per-vertex outputs (a vec4 each, max_vertices of them), its triangles' indices;
@@ -68,7 +69,7 @@ shader on a GPU that emulates task shaders (`radv_task_emulated`) splits the mes
 - the mesh stage is removed from the hardware stages. The pipeline binds the copy as its vertex
   shader, and its dynamic state leaves out what mesh pipelines do not have.
 
-The device's 128 MiB buffer (a 4 KiB header, then the slots) is made when the first pipeline
+The device's buffer (a 16 KiB header, then 16 MiB of slots) is made when the first pipeline
 with a task shader is created. The shaders hold no address: each draw uploads a block with the
 task emulation's records and payload ring and the buffer's header and slots
 (`radv_mesh_compute_block`), which both shaders take as their `gs_compute_draw` argument, as a
@@ -78,6 +79,10 @@ the object's data, and whether this path is on is part of the cache's UUID. Ocar
 came at 273 s with an empty cache and at 21 s with a full one (eden-radv 0010).
 
 ## Status
+
+Ocarina's mesh shaders take slots of 1.6 to 10.8 KB, 1,551 to 10,485 mesh workgroups a pass
+(the driver logs each pipeline's). The buffer was 128 MiB until empty passes were skipped
+(eden-radv 0011); the driver's own memory went from 220 to 108 MiB.
 
 On by default. `/data/eglantineps5/radv-mesh-compute.txt` holding `0` turns it off (the NGG mesh
 path, which hangs Ocarina).
@@ -99,6 +104,5 @@ Limits, where a pipeline keeps the hardware path:
 
 Not done yet:
 
-- sizing the buffer from the pipelines in use instead of 128 MiB;
 - measuring the cost against `EDEN_NX2_NO_MESH`;
 - pipeline statistics and mesh queries for these draws.
