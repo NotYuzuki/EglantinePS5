@@ -1,0 +1,505 @@
+From f822c1e9dfb4534425e6c9fbc3c951fe11173d30 Mon Sep 17 00:00:00 2001
+From: exploitizm <351399878+exploitizm@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 07:35:17 +1000
+Subject: [PATCH] radv/ps5: mesh shaders run as compute are cached with their
+ pipelines
+
+Their pipelines were compiled at every launch (about two minutes for Ocarina
+of Time before its first frame): the compute pass and the copy vertex shader
+named the device's buffers by address, so neither could be cached.
+
+The addresses now come at the draw, in a block uploaded per draw
+(radv_mesh_compute_block: the task emulation's records and payload ring,
+the buffer's header and slots) that both shaders take as their
+gs_compute_draw argument, as a geometry shader's passes and rasterization
+copy do (RADV_GS_COMPUTE_MESH for the compute pass, RADV_GS_COMPUTE_RAST for
+the copy). The pipeline cache keeps the compute pass after the pipeline's
+other shaders, with its vertices a workgroup and capacity in the object's
+data. Whether the path is on is part of the cache's UUID.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/amd/vulkan/radv_cmd_buffer.c        | 32 ++++++++++---
+ src/amd/vulkan/radv_device.c            |  9 ----
+ src/amd/vulkan/radv_mesh_compute.c      | 63 +++++++++++++++++++------
+ src/amd/vulkan/radv_mesh_compute.h      | 21 ++++++---
+ src/amd/vulkan/radv_physical_device.c   | 12 +++++
+ src/amd/vulkan/radv_pipeline_cache.c    | 21 ++++++++-
+ src/amd/vulkan/radv_pipeline_graphics.c | 19 ++++----
+ src/amd/vulkan/radv_shader_info.h       |  1 +
+ 8 files changed, 132 insertions(+), 46 deletions(-)
+
+diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
+index fc3cc12..fd4bf32 100644
+--- a/src/amd/vulkan/radv_cmd_buffer.c
++++ b/src/amd/vulkan/radv_cmd_buffer.c
+@@ -15701,7 +15701,8 @@ radv_task_emu_draw_indirect(struct radv_cmd_buffer *cmd_buffer, const struct rad
+ /* The compute pass of a mesh shader run as compute (radv_mesh_compute.h), over the workgroup
+  * count at indirect_va, with the graphics pipeline's descriptors and push constants. */
+ static void
+-radv_mesh_compute_dispatch(struct radv_cmd_buffer *cmd_buffer, const struct radv_shader *shader, uint64_t indirect_va)
++radv_mesh_compute_dispatch(struct radv_cmd_buffer *cmd_buffer, const struct radv_shader *shader, uint64_t indirect_va,
++                           uint64_t block_va)
+ {
+    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+    const struct radv_physical_device *pdev = radv_device_physical(device);
+@@ -15717,6 +15718,7 @@ radv_mesh_compute_dispatch(struct radv_cmd_buffer *cmd_buffer, const struct radv
+ 
+    radv_emit_compute_shader(pdev, cs, shader);
+    radv_emit_graphics_stage_for_compute(cmd_buffer, shader);
++   radv_emit_userdata_address(device, cs, shader, AC_UD_CS_GS_COMPUTE_DRAW, block_va);
+ 
+    /* The compute state is this pass's now (as after radv_task_emu_dispatch). */
+    cmd_buffer->state.dirty |= RADV_CMD_DIRTY_COMPUTE_PIPELINE | RADV_CMD_DIRTY_RAY_TRACING_PIPELINE;
+@@ -15741,8 +15743,8 @@ radv_mesh_compute_dispatch(struct radv_cmd_buffer *cmd_buffer, const struct radv
+  * count_va): the records pass, then per pass the first workgroup's index in the header, the
+  * compute pass and the copy draw. */
+ static void
+-radv_mesh_compute_chunk(struct radv_cmd_buffer *cmd_buffer, const struct radv_task_emu *emu, uint32_t draw_id,
+-                        uint32_t count, uint64_t count_va)
++radv_mesh_compute_chunk(struct radv_cmd_buffer *cmd_buffer, const struct radv_task_emu *emu, uint64_t block_va,
++                        uint32_t draw_id, uint32_t count, uint64_t count_va)
+ {
+    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+    const struct radv_pipeline *pipeline = &cmd_buffer->state.graphics_pipeline->base;
+@@ -15764,7 +15766,7 @@ radv_mesh_compute_chunk(struct radv_cmd_buffer *cmd_buffer, const struct radv_ta
+       radeon_check_space(device->ws, cs->b, 16);
+       radv_cs_write_data(device, cs, V_371_MICRO_ENGINE, header_va + RADV_MESH_COMPUTE_HEADER_BASE, 1, &first, false);
+ 
+-      radv_mesh_compute_dispatch(cmd_buffer, pipeline->mesh_compute, args_va);
++      radv_mesh_compute_dispatch(cmd_buffer, pipeline->mesh_compute, args_va, block_va);
+       radv_emit_cache_flush(cmd_buffer);
+ 
+       const struct radv_draw_info rast = {
+@@ -15806,6 +15808,21 @@ radv_mesh_compute_draw(struct radv_cmd_buffer *cmd_buffer, const struct radv_dra
+ 
+    radv_cs_add_buffer(device->ws, cmd_buffer->cs->b, device->mesh_compute_bo);
+ 
++   /* Where the draw's buffers are, for the compute pass and the copy. */
++   const uint64_t header_va = radv_buffer_get_va(device->mesh_compute_bo);
++   const struct radv_mesh_compute_block block = {
++      .records = emu.records_va,
++      .payload = radv_buffer_get_va(device->task_emu_bo) + RADV_TASK_EMU_PAYLOAD_OFFSET,
++      .header = header_va,
++      .slots = header_va + RADV_MESH_COMPUTE_HEADER_BYTES,
++   };
++   unsigned block_offset;
++   if (!radv_cmd_buffer_upload_data(cmd_buffer, sizeof(block), &block, &block_offset)) {
++      vk_command_buffer_set_error(&cmd_buffer->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
++      return;
++   }
++   const uint64_t block_va = radv_buffer_get_va(cmd_buffer->upload.upload_bo) + block_offset;
++
+    const uint32_t saved_topology = d->vk.ia.primitive_topology;
+    d->vk.ia.primitive_topology = V_008958_DI_PT_TRILIST;
+    state->dirty_dynamic |= RADV_DYNAMIC_PRIMITIVE_TOPOLOGY;
+@@ -15817,6 +15834,9 @@ radv_mesh_compute_draw(struct radv_cmd_buffer *cmd_buffer, const struct radv_dra
+       .stride = 16,
+    };
+    if (radv_before_draw(cmd_buffer, &rast, 1, false)) {
++      radeon_check_space(device->ws, cmd_buffer->cs->b, 16);
++      radv_emit_userdata_address(device, cmd_buffer->cs, state->shaders[MESA_SHADER_VERTEX], AC_UD_VS_GS_COMPUTE_DRAW,
++                                 block_va);
+       if (!info) {
+          for (uint32_t first = 0; first < workgroups; first += emu.entries) {
+             const uint32_t count = MIN2(emu.entries, workgroups - first);
+@@ -15828,7 +15848,7 @@ radv_mesh_compute_draw(struct radv_cmd_buffer *cmd_buffer, const struct radv_dra
+             }
+             radv_task_emu_dispatch(cmd_buffer, &emu, radv_buffer_get_va(cmd_buffer->upload.upload_bo) + offset,
+                                    count, 0);
+-            radv_mesh_compute_chunk(cmd_buffer, &emu, 0, count, 0);
++            radv_mesh_compute_chunk(cmd_buffer, &emu, block_va, 0, count, 0);
+          }
+       } else {
+          /* As radv_task_emu_draw_indirect: every chunk the task workgroup limit allows, those past
+@@ -15850,7 +15870,7 @@ radv_mesh_compute_draw(struct radv_cmd_buffer *cmd_buffer, const struct radv_dra
+                const uint64_t block_va = out_va + i * sizeof(struct radv_task_emu_block);
+                const uint64_t args_va = out_va + draws * chunks * sizeof(struct radv_task_emu_block) + i * 16;
+                radv_task_emu_dispatch(cmd_buffer, &emu, block_va, 0, args_va);
+-               radv_mesh_compute_chunk(cmd_buffer, &emu, first_draw + i / chunks, emu.entries, args_va);
++               radv_mesh_compute_chunk(cmd_buffer, &emu, block_va, first_draw + i / chunks, emu.entries, args_va);
+             }
+          }
+       }
+diff --git a/src/amd/vulkan/radv_device.c b/src/amd/vulkan/radv_device.c
+index 995bdd6..3d7d3bc 100644
+--- a/src/amd/vulkan/radv_device.c
++++ b/src/amd/vulkan/radv_device.c
+@@ -29,9 +29,6 @@
+ #include "radv_formats.h"
+ #include "radv_physical_device.h"
+ #include "radv_shader.h"
+-#ifdef RADV_GS_COMPUTE
+-#include "radv_mesh_compute.h"
+-#endif
+ #include "vk_common_entrypoints.h"
+ #include "vk_pipeline_cache.h"
+ #include "vk_util.h"
+@@ -1746,12 +1743,6 @@ radv_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCr
+       result = device->ws->buffer_make_resident(device->ws, device->task_emu_bo, true);
+       if (result != VK_SUCCESS)
+          goto fail;
+-
+-#ifdef RADV_GS_COMPUTE
+-      /* Mesh shaders run as compute read the task rings by address (radv_mesh_compute.h); their
+-       * own buffer is made with the first pipeline that may need it (radv_mesh_compute_init). */
+-      radv_mesh_compute_task_emu_va = radv_buffer_get_va(device->task_emu_bo);
+-#endif
+    }
+ 
+    if (pdev->info.has_graphics && !(instance->debug_flags & RADV_DEBUG_NO_IB_CHAINING))
+diff --git a/src/amd/vulkan/radv_mesh_compute.c b/src/amd/vulkan/radv_mesh_compute.c
+index 94866f3..46323b6 100644
+--- a/src/amd/vulkan/radv_mesh_compute.c
++++ b/src/amd/vulkan/radv_mesh_compute.c
+@@ -23,10 +23,6 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ 
+-uint64_t radv_mesh_compute_task_emu_va;
+-uint64_t radv_mesh_compute_header_va;
+-uint64_t radv_mesh_compute_slots_va;
+-
+ bool
+ radv_mesh_compute_enabled(void)
+ {
+@@ -65,8 +61,6 @@ radv_mesh_compute_init(struct radv_device *device)
+          if (result != VK_SUCCESS) {
+             radv_bo_destroy(device, NULL, bo);
+          } else {
+-            radv_mesh_compute_header_va = radv_buffer_get_va(bo);
+-            radv_mesh_compute_slots_va = radv_mesh_compute_header_va + RADV_MESH_COMPUTE_HEADER_BYTES;
+             p_atomic_set(&device->mesh_compute_bo, bo);
+          }
+       }
+@@ -85,8 +79,42 @@ struct mesh_compute_layout {
+    unsigned stride;      /* a slot */
+    unsigned capacity;    /* slots in a pass */
+    unsigned payload_stride;
++   uint32_t address32_hi; /* of the block (radv_mesh_compute_block) */
+ };
+ 
++/* The block's address until the shader's arguments are declared (radv_mesh_compute_lower_block). */
++#define BLOCK_ARG_PLACEHOLDER 0xffffu
++
++/* A 64-bit field of the draw's block (radv_mesh_compute_block). */
++static nir_def *
++block_field(nir_builder *b, const struct mesh_compute_layout *l, unsigned offset)
++{
++   nir_def *arg = nir_load_scalar_arg_amd(b, 1, .base = BLOCK_ARG_PLACEHOLDER);
++   nir_def *block = nir_pack_64_2x32_split(b, arg, nir_imm_int(b, l->address32_hi));
++   return nir_pack_64_2x32(b, ac_nir_load_smem(b, 2, block, nir_imm_int(b, offset), 8, ACCESS_CAN_SPECULATE));
++}
++
++static bool
++lower_block_arg(nir_builder *b, nir_intrinsic_instr *intr, void *data)
++{
++   const struct radv_shader_args *args = data;
++   if (intr->intrinsic != nir_intrinsic_load_scalar_arg_amd || nir_intrinsic_base(intr) != BLOCK_ARG_PLACEHOLDER)
++      return false;
++   b->cursor = nir_before_instr(&intr->instr);
++   nir_def_replace(&intr->def, ac_nir_load_arg(b, &args->ac, args->gs_compute_draw));
++   return true;
++}
++
++bool
++radv_mesh_compute_lower_block(nir_shader *nir, const struct radv_shader_stage *stage)
++{
++   bool progress = false;
++   assert(stage->args.gs_compute_draw.used);
++   NIR_PASS(progress, nir, nir_shader_intrinsics_pass, lower_block_arg, nir_metadata_control_flow,
++            (void *)&stage->args);
++   return progress;
++}
++
+ static const uint64_t allowed_vertex_outputs = VARYING_BIT_POS | BITFIELD64_RANGE(VARYING_SLOT_VAR0, 32);
+ 
+ bool
+@@ -96,7 +124,7 @@ radv_mesh_compute_wanted(const struct radv_graphics_state_key *gfx_state, const
+    const nir_shader *task = stages[MESA_SHADER_TASK].nir;
+    const nir_shader *fs = stages[MESA_SHADER_FRAGMENT].nir;
+ 
+-   if (!mesh || !task || !radv_mesh_compute_enabled() || !radv_mesh_compute_slots_va)
++   if (!mesh || !task || !radv_mesh_compute_enabled())
+       return false;
+ 
+    /* First slice: triangles, outputs that are positions and generic varyings, no
+@@ -155,8 +183,8 @@ build_copy_vs(const nir_shader_compiler_options *options, const struct mesh_comp
+    nir_def *in_buffer = nir_ult_imm(&b, wg, l->capacity);
+    wg = nir_umin(&b, wg, nir_imm_int(&b, l->capacity - 1));
+ 
+-   nir_def *slot =
+-      nir_iadd(&b, nir_imm_int64(&b, radv_mesh_compute_slots_va), nir_u2u64(&b, nir_imul_imm(&b, wg, l->stride)));
++   nir_def *slot = nir_iadd(&b, block_field(&b, l, offsetof(struct radv_mesh_compute_block, slots)),
++                            nir_u2u64(&b, nir_imul_imm(&b, wg, l->stride)));
+    nir_def *counts = nir_build_load_global(&b, 2, 32, slot, .align_mul = 8);
+    nir_def *num_vtx = nir_umin(&b, nir_channel(&b, counts, 0), nir_imm_int(&b, l->max_vertices));
+    nir_def *num_prm = nir_umin(&b, nir_channel(&b, counts, 1), nir_imm_int(&b, l->max_primitives));
+@@ -198,6 +226,7 @@ struct lower_state {
+    nir_def *index; /* the workgroup's index in its grid */
+    nir_def *entry; /* its task workgroup's ring entry */
+    nir_def *draw_id;
++   nir_def *payload; /* the task payload ring */
+ };
+ 
+ static nir_def *
+@@ -256,8 +285,7 @@ lower_mesh_intrinsic(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+       return true;
+    case nir_intrinsic_load_task_payload: {
+       nir_def *base = nir_iadd_imm(b, nir_imul_imm(b, s->entry, l->payload_stride), nir_intrinsic_base(intr));
+-      nir_def *addr = nir_iadd(b, nir_imm_int64(b, radv_mesh_compute_task_emu_va + RADV_TASK_EMU_PAYLOAD_OFFSET),
+-                               nir_u2u64(b, nir_iadd(b, base, intr->src[0].ssa)));
++      nir_def *addr = nir_iadd(b, s->payload, nir_u2u64(b, nir_iadd(b, base, intr->src[0].ssa)));
+       nir_def *value = nir_build_load_global(b, intr->def.num_components, intr->def.bit_size, addr, .align_mul = 4);
+       nir_def_replace(&intr->def, value);
+       return true;
+@@ -334,7 +362,7 @@ lower_mesh_to_compute(nir_shader *nir, const struct mesh_compute_layout *l)
+    nir_def *raw = nir_load_workgroup_id(&b);
+    struct lower_state s = {.l = l, .raw_workgroup_id = nir_def_instr(raw)};
+    nir_def *wg = nir_channel(&b, raw, 0);
+-   nir_def *header = nir_imm_int64(&b, radv_mesh_compute_header_va);
++   nir_def *header = block_field(&b, l, offsetof(struct radv_mesh_compute_block, header));
+    nir_def *base = nir_build_load_global(&b, 1, 32, nir_iadd_imm(&b, header, RADV_MESH_COMPUTE_HEADER_BASE),
+                                          .align_mul = 4, .access = ACCESS_COHERENT);
+    nir_def *records = nir_build_load_global(&b, 1, 32, nir_iadd_imm(&b, header, RADV_MESH_COMPUTE_HEADER_RECORDS),
+@@ -344,7 +372,8 @@ lower_mesh_to_compute(nir_shader *nir, const struct mesh_compute_layout *l)
+    /* Its task workgroup's record (radv_mesh_draw_record, a task workgroup each, in order): the last
+     * whose first mesh workgroup is not past it. The records' index is the task workgroup's ring
+     * entry. */
+-   nir_def *records_va = nir_imm_int64(&b, radv_mesh_compute_task_emu_va + RADV_TASK_EMU_RECORDS_OFFSET);
++   nir_def *records_va = block_field(&b, l, offsetof(struct radv_mesh_compute_block, records));
++   s.payload = block_field(&b, l, offsetof(struct radv_mesh_compute_block, payload));
+    nir_variable *lo_var = nir_local_variable_create(b.impl, glsl_uint_type(), "record_lo");
+    nir_variable *hi_var = nir_local_variable_create(b.impl, glsl_uint_type(), "record_hi");
+    nir_store_var(&b, lo_var, nir_imm_int(&b, 0), 0x1);
+@@ -379,7 +408,7 @@ lower_mesh_to_compute(nir_shader *nir, const struct mesh_compute_layout *l)
+                                      nir_iadd_imm(&b, record, offsetof(struct radv_mesh_draw_record, task_draw_id)),
+                                      .align_mul = 4);
+    nir_def *slot_index = nir_umin(&b, wg, nir_imm_int(&b, l->capacity - 1));
+-   s.slot = nir_iadd(&b, nir_imm_int64(&b, radv_mesh_compute_slots_va),
++   s.slot = nir_iadd(&b, block_field(&b, l, offsetof(struct radv_mesh_compute_block, slots)),
+                      nir_u2u64(&b, nir_imul_imm(&b, slot_index, l->stride)));
+ 
+    /* No counts until the shader sets them: a workgroup that never does draws nothing. */
+@@ -408,6 +437,7 @@ radv_mesh_compute_split(const struct radv_compiler_info *compiler_info, struct r
+    l.capacity = MIN2((RADV_MESH_COMPUTE_BYTES - RADV_MESH_COMPUTE_HEADER_BYTES) / l.stride,
+                      RADV_MESH_COMPUTE_CHUNK_WORKGROUPS);
+    l.payload_stride = align(MAX2(stages[MESA_SHADER_TASK].nir->info.task_payload_size, 16), 16);
++   l.address32_hi = compiler_info->hw.address32_hi;
+ 
+    nir_shader *vs = build_copy_vs(mesh->options, &l, compiler_info->key.ge_wave_size);
+    lower_mesh_to_compute(mesh, &l);
+@@ -423,6 +453,8 @@ radv_mesh_compute_split(const struct radv_compiler_info *compiler_info, struct r
+    vs_stage->stage = MESA_SHADER_VERTEX;
+    vs_stage->nir = vs;
+    vs_stage->next_stage = MESA_SHADER_FRAGMENT;
++   /* Its block argument, as a geometry shader's rasterization copy has (RADV_GS_COMPUTE_RAST). */
++   vs_stage->gs_compute_rast = true;
+ 
+    ms->nir = NULL;
+    ms->stage = MESA_SHADER_NONE;
+@@ -468,6 +500,8 @@ radv_mesh_compute_compile(const struct radv_compiler_info *compiler_info, struct
+    radv_nir_shader_info_init(MESA_SHADER_COMPUTE, MESA_SHADER_NONE, &stage.info);
+    radv_nir_shader_info_pass(compiler_info, nir, &stage.layout, &stage.key, NULL, RADV_PIPELINE_COMPUTE, false,
+                              &stage.info);
++   /* Its block argument (radv_mesh_compute_block). */
++   stage.info.gs_compute = RADV_GS_COMPUTE_MESH;
+    /* A graphics stage still, as radv_gs_compute_compile's passes are. */
+    if (stage.info.loads_dynamic_offsets && stage.layout.independent_sets)
+       stage.info.loads_dynamic_descriptors_offset_addr = true;
+@@ -476,6 +510,7 @@ radv_mesh_compute_compile(const struct radv_compiler_info *compiler_info, struct
+    stage.info.user_sgprs_locs = stage.args.user_sgprs_locs;
+    stage.info.inline_push_constant_mask = stage.args.ac.inline_push_const_mask;
+ 
++   radv_mesh_compute_lower_block(nir, &stage);
+    NIR_PASS(_, nir, nir_lower_compute_system_values, &compute_sysval_options);
+    radv_optimize_nir(nir, stage.key.optimisations_disabled);
+    radv_postprocess_nir(compiler_info, NULL, &stage);
+diff --git a/src/amd/vulkan/radv_mesh_compute.h b/src/amd/vulkan/radv_mesh_compute.h
+index 9aec695..41540f6 100644
+--- a/src/amd/vulkan/radv_mesh_compute.h
++++ b/src/amd/vulkan/radv_mesh_compute.h
+@@ -47,19 +47,22 @@
+ struct radv_compiler_info;
+ struct radv_graphics_state_key;
+ 
+-/* The device's buffers the shaders name by address (set at device creation; these pipelines
+- * are not cached, radv_graphics_pipeline_compile). */
+-extern uint64_t radv_mesh_compute_task_emu_va;
+-extern uint64_t radv_mesh_compute_header_va;
+-extern uint64_t radv_mesh_compute_slots_va;
++/* Where a draw's buffers are, for the compute pass and the copy: uploaded per draw, and named by
++ * the shaders' gs_compute_draw argument (AC_UD_CS_GS_COMPUTE_DRAW, AC_UD_VS_GS_COMPUTE_DRAW), so
++ * the shaders hold no address and their pipelines can be cached. */
++struct radv_mesh_compute_block {
++   uint64_t records; /* the task emulation's records (radv_mesh_draw_record) */
++   uint64_t payload; /* its task payload ring */
++   uint64_t header;  /* the device's buffer */
++   uint64_t slots;   /* its slots, after the header */
++};
+ 
+ /* Whether mesh shaders of emulated task draws take this path: unless
+  * /data/eglantineps5/radv-mesh-compute.txt says 0 (read once). */
+ bool radv_mesh_compute_enabled(void);
+ 
+ struct radv_device;
+-/* The device's buffer, made once (the first pipeline with a task shader, before its shaders are
+- * compiled, since they name it by address). */
++/* The device's buffer, made once (the first pipeline with a task shader). */
+ VkResult radv_mesh_compute_init(struct radv_device *device);
+ 
+ struct radv_mesh_compute_split {
+@@ -81,6 +84,10 @@ bool radv_mesh_compute_wanted(const struct radv_graphics_state_key *gfx_state,
+ void radv_mesh_compute_split(const struct radv_compiler_info *compiler_info, struct radv_shader_stage *stages,
+                              struct radv_mesh_compute_split *out);
+ 
++/* The block's address in a shader of this path, once its arguments are declared (the copy vertex
++ * shader's in the pipeline compile, the compute pass's in radv_mesh_compute_compile). */
++bool radv_mesh_compute_lower_block(nir_shader *nir, const struct radv_shader_stage *stage);
++
+ struct radv_shader_binary *radv_mesh_compute_compile(const struct radv_compiler_info *compiler_info,
+                                                      struct radv_mesh_compute_split *split,
+                                                      struct radv_shader_debug_info *debug);
+diff --git a/src/amd/vulkan/radv_physical_device.c b/src/amd/vulkan/radv_physical_device.c
+index c0826e5..bac9dd2 100644
+--- a/src/amd/vulkan/radv_physical_device.c
++++ b/src/amd/vulkan/radv_physical_device.c
+@@ -30,6 +30,9 @@
+ #include "radv_entrypoints.h"
+ #include "radv_instance.h"
+ #include "radv_physical_device.h"
++#ifdef RADV_GS_COMPUTE
++#include "radv_mesh_compute.h"
++#endif
+ #include "radv_pipeline_rt.h"
+ #include "radv_video.h"
+ #include "radv_wsi.h"
+@@ -391,6 +394,15 @@ radv_device_get_cache_uuid(struct radv_physical_device *pdev, void *uuid)
+       return -1;
+ #endif
+ 
++#ifdef RADV_GS_COMPUTE
++   {
++      /* Whether emulated task draws' mesh shaders run as compute (radv_mesh_compute.h): their
++       * pipelines are compiled differently. */
++      const uint8_t mesh_compute = radv_mesh_compute_enabled();
++      _mesa_blake3_update(&ctx, &mesh_compute, sizeof(mesh_compute));
++   }
++#endif
++
+    _mesa_blake3_final(&ctx, blake3);
+ 
+    memcpy(uuid, blake3, VK_UUID_SIZE);
+diff --git a/src/amd/vulkan/radv_pipeline_cache.c b/src/amd/vulkan/radv_pipeline_cache.c
+index 3daf511..2de091d 100644
+--- a/src/amd/vulkan/radv_pipeline_cache.c
++++ b/src/amd/vulkan/radv_pipeline_cache.c
+@@ -415,7 +415,15 @@ radv_graphics_pipeline_cache_search(struct radv_device *device, struct vk_pipeli
+ 
+    for (unsigned i = 0; i < pipeline_obj->num_shaders; i++) {
+       mesa_shader_stage s = pipeline_obj->shaders[i]->info.stage;
+-      if (s == MESA_SHADER_VERTEX && i > 0) {
++      if (s == MESA_SHADER_COMPUTE) {
++         /* A mesh shader run as compute (radv_mesh_compute.h), placed last, its counts in the
++          * object's data. */
++         const uint32_t *counts = pipeline_obj->data;
++         assert(i == pipeline_obj->num_shaders - 1 && pipeline_obj->data_size == 2 * sizeof(uint32_t));
++         pipeline->base.mesh_compute = radv_shader_ref(pipeline_obj->shaders[i]);
++         pipeline->base.mesh_compute_vertices_per_workgroup = counts[0];
++         pipeline->base.mesh_compute_capacity = counts[1];
++      } else if (s == MESA_SHADER_VERTEX && i > 0) {
+          /* The GS copy-shader is a VS placed after all other stages */
+          assert(i == pipeline_obj->num_shaders - 1 && pipeline->base.shaders[MESA_SHADER_GEOMETRY]);
+          pipeline->base.gs_copy_shader = radv_shader_ref(pipeline_obj->shaders[i]);
+@@ -459,9 +467,11 @@ radv_pipeline_cache_insert(struct radv_device *device, struct vk_pipeline_cache
+    for (unsigned i = 0; i < MESA_VULKAN_SHADER_STAGES; ++i)
+       num_shaders += pipeline->shaders[i] ? 1 : 0;
+    num_shaders += pipeline->gs_copy_shader ? 1 : 0;
++   num_shaders += pipeline->mesh_compute ? 1 : 0;
+ 
+    struct radv_pipeline_cache_object *pipeline_obj;
+-   pipeline_obj = radv_pipeline_cache_object_create(&device->vk, num_shaders, pipeline->blake3, 0);
++   pipeline_obj = radv_pipeline_cache_object_create(&device->vk, num_shaders, pipeline->blake3,
++                                                    pipeline->mesh_compute ? 2 * sizeof(uint32_t) : 0);
+ 
+    if (!pipeline_obj)
+       return;
+@@ -474,6 +484,13 @@ radv_pipeline_cache_insert(struct radv_device *device, struct vk_pipeline_cache
+    /* Place the GS copy-shader after all other stages */
+    if (pipeline->gs_copy_shader)
+       pipeline_obj->shaders[idx++] = radv_shader_ref(pipeline->gs_copy_shader);
++   /* A mesh shader run as compute last, its counts in the data (radv_graphics_pipeline_cache_search). */
++   if (pipeline->mesh_compute) {
++      uint32_t *counts = pipeline_obj->data;
++      pipeline_obj->shaders[idx++] = radv_shader_ref(pipeline->mesh_compute);
++      counts[0] = pipeline->mesh_compute_vertices_per_workgroup;
++      counts[1] = pipeline->mesh_compute_capacity;
++   }
+ 
+    assert(idx == num_shaders);
+ 
+diff --git a/src/amd/vulkan/radv_pipeline_graphics.c b/src/amd/vulkan/radv_pipeline_graphics.c
+index ba112d7..ad8d315 100644
+--- a/src/amd/vulkan/radv_pipeline_graphics.c
++++ b/src/amd/vulkan/radv_pipeline_graphics.c
+@@ -2846,6 +2846,10 @@ radv_graphics_shaders_compile(const struct radv_compiler_info *compiler_info, st
+ 
+    if (gs_compute_rast)
+       radv_gs_compute_lower_sysvals(stages[MESA_SHADER_VERTEX].nir, compiler_info, &stages[MESA_SHADER_VERTEX]);
++#ifdef RADV_GS_COMPUTE
++   if (mesh_compute_used)
++      radv_mesh_compute_lower_block(stages[MESA_SHADER_VERTEX].nir, &stages[MESA_SHADER_VERTEX]);
++#endif
+ 
+    radv_foreach_stage (i, active_nir_stages) {
+       int64_t stage_start = os_time_get_nano();
+@@ -3122,11 +3126,10 @@ radv_graphics_pipeline_compile(struct radv_graphics_pipeline *pipeline, const Vk
+    }
+ 
+ #ifdef RADV_GS_COMPUTE
+-   /* An emulated task shader's mesh shader may run as compute (radv_mesh_compute.h): not cached, and
+-    * not taken from the cache either, where it may be as a mesh shader. Its buffer comes first:
+-    * the shaders name it by address. */
++   /* An emulated task shader's mesh shader may run as compute (radv_mesh_compute.h), whose draws
++    * need the device's buffer. Whether that path is on is in the cache's UUID
++    * (radv_device_get_cache_uuid). */
+    if (stages[MESA_SHADER_TASK].stage != MESA_SHADER_NONE && device->task_emu_bo && radv_mesh_compute_enabled()) {
+-      skip_shaders_cache = true;
+       result = radv_mesh_compute_init(device);
+       if (result != VK_SUCCESS)
+          return result;
+@@ -3210,15 +3213,15 @@ radv_graphics_pipeline_compile(struct radv_graphics_pipeline *pipeline, const Vk
+    }
+ 
+    if (gs_compute.mesh_used) {
+-      /* Its compute pass is not in the shaders cache, and the pass and the copy name the device's
+-       * buffers by address. */
+-      skip_shaders_cache = true;
++      /* Cached with the pipeline (radv_pipeline_cache_insert). */
+       if (gs_compute.mesh_binary)
+          pipeline->base.mesh_compute =
+-            radv_shader_create(device, cache, gs_compute.mesh_binary, true, &gs_compute.mesh_debug);
++            radv_shader_create(device, cache, gs_compute.mesh_binary, skip_shaders_cache, &gs_compute.mesh_debug);
+       pipeline->base.mesh_compute_vertices_per_workgroup = gs_compute.mesh_vertices_per_workgroup;
+       pipeline->base.mesh_compute_capacity = gs_compute.mesh_capacity;
+       free(gs_compute.mesh_binary);
++      if (!pipeline->base.mesh_compute)
++         skip_shaders_cache = true;
+    }
+ 
+    if (!skip_shaders_cache) {
+diff --git a/src/amd/vulkan/radv_shader_info.h b/src/amd/vulkan/radv_shader_info.h
+index fcc5b7a..d64348e 100644
+--- a/src/amd/vulkan/radv_shader_info.h
++++ b/src/amd/vulkan/radv_shader_info.h
+@@ -86,6 +86,7 @@ enum radv_gs_compute_kind {
+    RADV_GS_COMPUTE_TCS,    /* the tessellation control shader, outputs to memory */
+    RADV_GS_COMPUTE_TES,    /* the tessellation evaluation shader over the tessellator's output, outputs to memory */
+    RADV_GS_COMPUTE_RAST,   /* the hardware vertex shader drawing the GS output */
++   RADV_GS_COMPUTE_MESH,   /* a mesh shader run as compute (radv_mesh_compute.h) */
+ };
+ 
+ struct radv_shader_info {
+-- 
+2.53.0
+

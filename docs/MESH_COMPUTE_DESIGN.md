@@ -69,8 +69,13 @@ shader on a GPU that emulates task shaders (`radv_task_emulated`) splits the mes
   shader, and its dynamic state leaves out what mesh pipelines do not have.
 
 The device's 128 MiB buffer (a 4 KiB header, then the slots) is made when the first pipeline
-with a task shader is created. The shaders name it and the task rings by address, so these
-pipelines are not cached, and task pipelines are not taken from the cache while this path is on.
+with a task shader is created. The shaders hold no address: each draw uploads a block with the
+task emulation's records and payload ring and the buffer's header and slots
+(`radv_mesh_compute_block`), which both shaders take as their `gs_compute_draw` argument, as a
+geometry shader's passes do. So these pipelines are cached like any other: the pipeline cache
+keeps the compute pass after the other shaders, with its vertices a workgroup and capacity in
+the object's data, and whether this path is on is part of the cache's UUID. Ocarina's first frame
+came at 273 s with an empty cache and at 21 s with a full one (eden-radv 0010).
 
 ## Status
 
@@ -94,7 +99,6 @@ Limits, where a pipeline keeps the hardware path:
 
 Not done yet:
 
-- caching these pipelines (they compile at every launch);
 - sizing the buffer from the pipelines in use instead of 128 MiB;
 - measuring the cost against `EDEN_NX2_NO_MESH`;
 - pipeline statistics and mesh queries for these draws.
