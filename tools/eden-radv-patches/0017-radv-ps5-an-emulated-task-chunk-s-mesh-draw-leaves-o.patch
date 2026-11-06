@@ -1,0 +1,271 @@
+From 54e4676b8cf8e26d8a210401030fe0d4c1a07aba Mon Sep 17 00:00:00 2001
+From: exploitizm <351399878+exploitizm@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 16:27:47 +1000
+Subject: [PATCH] radv/ps5: an emulated task chunk's mesh draw leaves out its
+ empty records (experiment 0x10000)
+
+Run 16:24 (0x8001): the stuck chunk's DRAW_INDIRECT_MULTI had four records,
+of 11, 0, 0 and 0 mesh workgroups (task workgroups that emitted none). All
+11 workgroups started and their 44 waves ended, and the draw never reached
+end-of-pipe: the PS5 hangs at a draw without vertices in a multi draw of
+mesh workgroups.
+
+With 0x10000 the records prepass keeps only the records with workgroups, in
+order, writes their count where the draw reads it (COUNT_INDIRECT), and each
+record carries its task workgroup's ring entry (task_entry), which the mesh
+shader reads in place of its index in the packet.
+---
+ src/amd/vulkan/meta/radv_meta_mesh_draw.c | 12 ++++++---
+ src/amd/vulkan/nir/radv_meta_nir.c        | 32 +++++++++++++++++------
+ src/amd/vulkan/nir/radv_nir_lower_abi.c   |  5 ++--
+ src/amd/vulkan/radv_cmd_buffer.c          | 20 ++++++++++++--
+ src/amd/vulkan/radv_cmd_buffer.h          |  6 +++++
+ src/amd/vulkan/radv_shader.h              |  9 ++++---
+ 6 files changed, 65 insertions(+), 19 deletions(-)
+
+diff --git a/src/amd/vulkan/meta/radv_meta_mesh_draw.c b/src/amd/vulkan/meta/radv_meta_mesh_draw.c
+index ebbe5fb..1c75f7e 100644
+--- a/src/amd/vulkan/meta/radv_meta_mesh_draw.c
++++ b/src/amd/vulkan/meta/radv_meta_mesh_draw.c
+@@ -79,7 +79,7 @@ radv_meta_mesh_draw_records(struct radv_cmd_buffer *cmd_buffer, uint64_t indirec
+       records_va = radv_buffer_get_va(cmd_buffer->upload.upload_bo) + offset;
+    }
+ 
+-   VkResult result = get_pipeline(device, RADV_META_OBJECT_KEY_MESH_DRAW_RECORDS, 52,
++   VkResult result = get_pipeline(device, RADV_META_OBJECT_KEY_MESH_DRAW_RECORDS, 64,
+                                   radv_meta_nir_build_mesh_draw_records_cs, &pipeline, &layout);
+    if (result != VK_SUCCESS) {
+       vk_command_buffer_set_error(&cmd_buffer->vk, result);
+@@ -95,15 +95,19 @@ radv_meta_mesh_draw_records(struct radv_cmd_buffer *cmd_buffer, uint64_t indirec
+    assert(publish_ring >> 32 == 0 || (publish_ring >> 32) == radv_device_physical(device)->info.address32_hi);
+    /* The most workgroups a record launches: a task+mesh hang experiment (radv_ps5_task_emu_debug). */
+    const uint32_t limit = task_rings && (radv_ps5_task_emu_debug() & 0x10) ? parts : UINT32_MAX;
+-   const uint32_t constants[13] = {
++   /* An emulated task chunk's records leave out its task workgroups without mesh workgroups:
++    * the PS5 hangs at a draw without vertices in a DRAW_INDIRECT_MULTI of mesh workgroups. Their
++    * count goes to radv_task_emu_count_va, which the draw reads. */
++   const uint64_t count_out = radv_task_emu_compacts(device, task_rings) ? radv_task_emu_count_va(device) : 0;
++   const uint32_t constants[16] = {
+       indirect_va,    indirect_va >> 32, records_va, records_va >> 32, count_va,   count_va >> 32,
+       stride,         max_count,         parts,      publish_ring,     task_rings, task_draw_id,
+-      limit,
++      limit,          count_out != 0,    count_out,  count_out >> 32,
+    };
+    radv_meta_push_constants(cmd_buffer, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(constants), constants);
+ 
+    /* With a ring, one workgroup goes through the draws in order. */
+-   radv_unaligned_dispatch(cmd_buffer, publish_ring ? 32 : max_count, 1, 1);
++   radv_unaligned_dispatch(cmd_buffer, publish_ring || count_out ? 32 : max_count, 1, 1);
+ 
+    radv_meta_end(cmd_buffer);
+ 
+diff --git a/src/amd/vulkan/nir/radv_meta_nir.c b/src/amd/vulkan/nir/radv_meta_nir.c
+index 45b1887..0a8b763 100644
+--- a/src/amd/vulkan/nir/radv_meta_nir.c
++++ b/src/amd/vulkan/nir/radv_meta_nir.c
+@@ -1437,7 +1437,7 @@ radv_meta_nir_build_copy_memory_indirect_preprocess_cs(void)
+  * ring and the packet's workgroups. Without, an invocation writes a draw.
+  */
+ static void
+-mesh_draw_record(nir_builder *b, nir_def *draw, nir_def *records_addr, nir_def *parts, nir_def *ring,
++mesh_draw_record(nir_builder *b, nir_def *slot, nir_def *draw, nir_def *records_addr, nir_def *parts, nir_def *ring,
+                  nir_def *first_workgroup, nir_def *grid, nir_def *task_rings, nir_def *task_draw_id)
+ {
+    /* A vertex launches a workgroup, or each of its parts; at most the limit
+@@ -1450,14 +1450,14 @@ mesh_draw_record(nir_builder *b, nir_def *draw, nir_def *records_addr, nir_def *
+    nir_def *zero = nir_imm_int(b, 0);
+ 
+    nir_def *record_addr =
+-      nir_iadd(b, records_addr, nir_u2u64(b, nir_imul_imm(b, draw, sizeof(struct radv_mesh_draw_record))));
++      nir_iadd(b, records_addr, nir_u2u64(b, nir_imul_imm(b, slot, sizeof(struct radv_mesh_draw_record))));
+    nir_build_store_global(b, nir_vec4(b, vertices, nir_imm_int(b, 1), zero, zero), record_addr, .align_mul = 16);
+    nir_build_store_global(b, nir_vec4(b, nir_channel(b, grid, 0), nir_channel(b, grid, 1), nir_channel(b, grid, 2), ring),
+                           nir_iadd_imm(b, record_addr, 16), .align_mul = 16);
+    nir_build_store_global(b, nir_vec4(b, nir_unpack_64_2x32_split_x(b, first_workgroup),
+                                       nir_unpack_64_2x32_split_y(b, first_workgroup), zero, zero),
+                           nir_iadd_imm(b, record_addr, 32), .align_mul = 16);
+-   nir_build_store_global(b, nir_vec4(b, task_rings, task_draw_id, zero, zero), nir_iadd_imm(b, record_addr, 48),
++   nir_build_store_global(b, nir_vec4(b, task_rings, task_draw_id, draw, zero), nir_iadd_imm(b, record_addr, 48),
+                           .align_mul = 16);
+ }
+ 
+@@ -1476,7 +1476,8 @@ radv_meta_nir_build_mesh_draw_records_cs(void)
+                     offsetof(struct radv_mesh_draw_record, first_workgroup) == 32 &&
+                     offsetof(struct radv_mesh_draw_record, workgroups) == 40 &&
+                     offsetof(struct radv_mesh_draw_record, task_rings) == 48 &&
+-                    offsetof(struct radv_mesh_draw_record, task_draw_id) == 52,
++                    offsetof(struct radv_mesh_draw_record, task_draw_id) == 52 &&
++                    offsetof(struct radv_mesh_draw_record, task_entry) == 56,
+                  "the stores below");
+ 
+    nir_builder b = radv_meta_nir_init_shader(MESA_SHADER_COMPUTE, "meta_mesh_draw_records_cs");
+@@ -1494,6 +1495,9 @@ radv_meta_nir_build_mesh_draw_records_cs(void)
+    nir_def *ring = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0), .base = 36, .range = 4);
+    nir_def *task_rings = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0), .base = 40, .range = 4);
+    nir_def *task_draw_id = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0), .base = 44, .range = 4);
++   /* Leave out the draws without workgroups, their count at count_out (radv_meta_mesh_draw_records). */
++   nir_def *compact = nir_ine_imm(&b, nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0), .base = 52, .range = 4), 0);
++   nir_def *count_out = nir_load_push_constant(&b, 1, 64, nir_imm_int(&b, 0), .base = 56, .range = 8);
+ 
+    /* Only the draws the count buffer has. */
+    nir_push_if(&b, nir_ine_imm(&b, count_addr, 0));
+@@ -1501,12 +1505,12 @@ radv_meta_nir_build_mesh_draw_records_cs(void)
+    nir_pop_if(&b, NULL);
+    count = nir_if_phi(&b, count, max_count);
+ 
+-   nir_push_if(&b, nir_ieq_imm(&b, ring, 0));
++   nir_push_if(&b, nir_iand(&b, nir_ieq_imm(&b, ring, 0), nir_inot(&b, compact)));
+    {
+       nir_push_if(&b, nir_ult(&b, global_id, count));
+       {
+          nir_def *grid = mesh_draw_grid(&b, global_id, indirect_addr, stride);
+-         mesh_draw_record(&b, global_id, records_addr, parts, ring, nir_imm_int64(&b, 0), grid, task_rings,
++         mesh_draw_record(&b, global_id, global_id, records_addr, parts, ring, nir_imm_int64(&b, 0), grid, task_rings,
+                           task_draw_id);
+       }
+       nir_pop_if(&b, NULL);
+@@ -1515,8 +1519,10 @@ radv_meta_nir_build_mesh_draw_records_cs(void)
+    {
+       nir_variable *first_var = nir_local_variable_create(b.impl, glsl_uint_type(), "first_draw");
+       nir_variable *workgroups_var = nir_local_variable_create(b.impl, glsl_uint64_t_type(), "workgroups");
++      nir_variable *slots_var = nir_local_variable_create(b.impl, glsl_uint_type(), "slots");
+       nir_store_var(&b, first_var, nir_imm_int(&b, 0), 0x1);
+       nir_store_var(&b, workgroups_var, nir_imm_int64(&b, 0), 0x1);
++      nir_store_var(&b, slots_var, nir_imm_int(&b, 0), 0x1);
+ 
+       nir_def *lane = nir_load_local_invocation_index(&b);
+       nir_push_loop(&b);
+@@ -1540,11 +1546,18 @@ radv_meta_nir_build_mesh_draw_records_cs(void)
+          nir_def *sum = nir_reduce(&b, own, .reduction_op = nir_op_iadd);
+          nir_def *workgroups = nir_load_var(&b, workgroups_var);
+ 
+-         nir_push_if(&b, active);
+-         mesh_draw_record(&b, draw, records_addr, parts, ring, nir_iadd(&b, workgroups, nir_u2u64(&b, before)),
++         /* Compacted, a draw without workgroups gets no record; the others go in order. */
++         nir_def *kept = nir_iand(&b, active, nir_ior(&b, nir_inot(&b, compact), nir_ine_imm(&b, own, 0)));
++         nir_def *kept_1 = nir_b2i32(&b, kept);
++         nir_def *slots = nir_load_var(&b, slots_var);
++         nir_def *slot = nir_bcsel(&b, compact, nir_iadd(&b, slots, nir_exclusive_scan(&b, kept_1, .reduction_op = nir_op_iadd)), draw);
++
++         nir_push_if(&b, kept);
++         mesh_draw_record(&b, slot, draw, records_addr, parts, ring, nir_iadd(&b, workgroups, nir_u2u64(&b, before)),
+                           grid, task_rings, task_draw_id);
+          nir_pop_if(&b, NULL);
+ 
++         nir_store_var(&b, slots_var, nir_iadd(&b, slots, nir_reduce(&b, kept_1, .reduction_op = nir_op_iadd)), 0x1);
+          nir_store_var(&b, workgroups_var, nir_iadd(&b, workgroups, nir_u2u64(&b, sum)), 0x1);
+          nir_store_var(&b, first_var, nir_iadd_imm(&b, first, 32), 0x1);
+       }
+@@ -1558,6 +1571,9 @@ radv_meta_nir_build_mesh_draw_records_cs(void)
+                                          nir_unpack_64_2x32_split_y(&b, workgroups)),
+                                 nir_iadd_imm(&b, records_addr, offsetof(struct radv_mesh_draw_record, workgroups)),
+                                 .align_mul = 8);
++         nir_push_if(&b, compact);
++         nir_build_store_global(&b, nir_load_var(&b, slots_var), count_out, .align_mul = 4);
++         nir_pop_if(&b, NULL);
+       }
+       nir_pop_if(&b, NULL);
+    }
+diff --git a/src/amd/vulkan/nir/radv_nir_lower_abi.c b/src/amd/vulkan/nir/radv_nir_lower_abi.c
+index bbbc206..0bfc582 100644
+--- a/src/amd/vulkan/nir/radv_nir_lower_abi.c
++++ b/src/amd/vulkan/nir/radv_nir_lower_abi.c
+@@ -589,8 +589,9 @@ lower_mesh_draw_record(nir_builder *b, nir_intrinsic_instr *intrin, void *state)
+                                ACCESS_CAN_SPECULATE);
+       break;
+    case nir_intrinsic_load_task_ring_entry_amd:
+-      /* The record's index is its task workgroup's ring entry. */
+-      value = nir_load_draw_id(b);
++      /* The record's task workgroup's ring entry (radv_mesh_draw_record.task_entry). */
++      value = ac_nir_load_smem(b, 1, records, nir_iadd_imm(b, draw, offsetof(struct radv_mesh_draw_record, task_entry)),
++                               4, ACCESS_CAN_SPECULATE);
+       break;
+    default: {
+       /* The task rings, from the table the first record names. */
+diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
+index ff05f43..7e4a39f 100644
+--- a/src/amd/vulkan/radv_cmd_buffer.c
++++ b/src/amd/vulkan/radv_cmd_buffer.c
+@@ -15451,7 +15451,8 @@ extern uint64_t radv_ps5_task_emu_note[8];
+  * for the mesh shaders after each chunk's mesh draw and then writes and waits on a marker, so a
+  * stall dump stopping at that marker says the mesh shaders never finished; 0x80 and 0x100 change
+  * the mesh lowering (ac_ps5_mesh_experiments); 0x4000 leaves GE_CNTL.VERT_GRP_SIZE of mesh shaders
+- * out of GFX10's NGG workaround. */
++ * out of GFX10's NGG workaround; 0x10000 leaves the records of task workgroups without mesh
++ * workgroups out of a chunk's mesh draw (radv_task_emu_compacts). */
+ uint32_t
+ radv_ps5_task_emu_debug(void)
+ {
+@@ -15623,6 +15624,18 @@ radv_task_emu_dispatch(struct radv_cmd_buffer *cmd_buffer, const struct radv_tas
+    }
+ }
+ 
++bool
++radv_task_emu_compacts(const struct radv_device *device, uint32_t task_rings)
++{
++   return task_rings && device->task_emu_bo && (radv_ps5_task_emu_debug() & 0x10000);
++}
++
++uint64_t
++radv_task_emu_count_va(const struct radv_device *device)
++{
++   return radv_buffer_get_va(device->task_emu_bo) + RADV_TASK_EMU_BYTES - 128;
++}
++
+ /* A chunk's mesh workgroups, from its draw ring's count entries or the count
+  * at count_va. */
+ static void
+@@ -15659,7 +15672,10 @@ radv_task_emu_draw_chunk(struct radv_cmd_buffer *cmd_buffer, const struct radv_t
+    if (!(experiments & 8)) {
+       radv_emit_indirect_buffer(cs, emu->records_va, false);
+       radv_emit_userdata_address(device, cs, mesh_shader, AC_UD_VS_MS_DRAW_RECORDS, emu->records_va);
+-      radv_cs_emit_indirect_draw_packet(cmd_buffer, false, count, count_va, sizeof(struct radv_mesh_draw_record),
++      /* Records left out (radv_task_emu_compacts): as many draws as the prepass kept. */
++      const uint64_t draws_va = radv_task_emu_compacts(device, (uint32_t)emu->rings_va) ? radv_task_emu_count_va(device)
++                                                                                         : count_va;
++      radv_cs_emit_indirect_draw_packet(cmd_buffer, false, count, draws_va, sizeof(struct radv_mesh_draw_record),
+                                         true);
+    }
+    if (experiments & 0x40) {
+diff --git a/src/amd/vulkan/radv_cmd_buffer.h b/src/amd/vulkan/radv_cmd_buffer.h
+index 1e03a40..b90a16d 100644
+--- a/src/amd/vulkan/radv_cmd_buffer.h
++++ b/src/amd/vulkan/radv_cmd_buffer.h
+@@ -705,6 +705,12 @@ radv_cmdbuf_has_stage(const struct radv_cmd_buffer *cmd_buffer, mesa_shader_stag
+ /* radv_cmd_buffer.c: the task+mesh hang experiments (PS5). */
+ uint32_t radv_ps5_task_emu_debug(void);
+ 
++/* Whether an emulated task chunk's records (task_rings set) leave out its task
++ * workgroups without mesh workgroups, and where their count goes
++ * (radv_meta_mesh_draw_records). */
++bool radv_task_emu_compacts(const struct radv_device *device, uint32_t task_rings);
++uint64_t radv_task_emu_count_va(const struct radv_device *device);
++
+ static inline uint32_t
+ radv_get_num_pipeline_stat_queries(struct radv_cmd_buffer *cmd_buffer)
+ {
+diff --git a/src/amd/vulkan/radv_shader.h b/src/amd/vulkan/radv_shader.h
+index 58e6ea7..a9c3d21 100644
+--- a/src/amd/vulkan/radv_shader.h
++++ b/src/amd/vulkan/radv_shader.h
+@@ -295,11 +295,14 @@ struct radv_mesh_draw_record {
+    uint64_t workgroups;
+    /* With emulated task shaders (radv_task_emulated): the first record's task
+     * ring table (radv_task_emu_rings, in the 32-bit window), and each record's
+-    * task draw, which the mesh shader reads as its draw ID. The record's index
+-    * in its packet is its task workgroup's ring entry. */
++    * task draw, which the mesh shader reads as its draw ID, and its task
++    * workgroup's ring entry, which is not the record's index in its packet
++    * when the records of task workgroups without mesh workgroups are left out
++    * (radv_meta_mesh_draw_records). */
+    uint32_t task_rings;
+    uint32_t task_draw_id;
+-   uint32_t pad[2];
++   uint32_t task_entry;
++   uint32_t pad;
+ };
+ 
+ /* An emulated task draw's chunk (radv_task_emulated), which its task shader
+-- 
+2.53.0
+
