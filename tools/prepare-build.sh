@@ -64,7 +64,8 @@ bash tools/build-common-dialog-stub.sh
 # The driver's display code carries this repository's adaptation (tools/patch-radv-wsi.py): a
 # driver built with another version of it is built again (only the changed file compiles).
 # So is a driver built from another Mesa revision than tools/deps.json pins.
-radv_release=../mihawk-vulkan-review/.deps/native/radv-release
+source tools/radv-refs.sh
+radv_release=$(eden_radv_refs)/mihawk-vulkan-review/.deps/native/radv-release
 mesa_pin=$(python3 -c 'import json; print(next(i["commit"] for i in json.load(open("tools/deps.json"))["items"] if i["name"] == "ps5-mesa"))')
 if [[ -f $radv_release/lib/libvulkan_radeon.ps5.a ]]; then
     built=$(sed -n 's/^revision: //p' "$radv_release/PROVENANCE.txt" 2>/dev/null || true)

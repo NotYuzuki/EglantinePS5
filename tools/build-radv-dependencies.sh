@@ -2,7 +2,9 @@
 # Build isolated, pinned RADV dependencies; never deploy or replace the old SDK.
 set -euo pipefail
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-refs=$(dirname "$root")
+# The folder of the three checkouts (tools/radv-refs.sh: EDEN_RADV_REFS, .local/radv-refs).
+source "$root/tools/radv-refs.sh"
+refs=$(eden_radv_refs)
 export PS5_MESA_FORK="$refs/mihawk-mesa-review"
 export PS5_PAYLOAD_SDK_FORK="$refs/mihawk-sdk-review"
 vulkan="$refs/mihawk-vulkan-review"

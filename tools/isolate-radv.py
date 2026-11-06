@@ -23,7 +23,7 @@ import subprocess
 import tempfile
 
 root = Path(__file__).resolve().parents[1]
-source = root.parent/'mihawk-vulkan-review/.deps/native/radv-release/lib/libvulkan_radeon.ps5.a'
+source = __import__('runpy').run_path(str(root/'tools/radv_refs.py'))['radv_refs'](root)/'mihawk-vulkan-review/.deps/native/radv-release/lib/libvulkan_radeon.ps5.a'
 # EDEN_RADV_ISOLATED: another output folder (a check that leaves the build's archive alone).
 output = Path(os.environ.get('EDEN_RADV_ISOLATED', root/'build/radv-isolated'))
 output.mkdir(parents=True, exist_ok=True)

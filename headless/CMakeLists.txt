@@ -2585,9 +2585,22 @@ void Initialize() {
         "${PORT_ROOT}/tools/link-headless-native.sh" "${PORT_ROOT}/tools/unwind.ld"
         "${PORT_ROOT}/tools/app-symbols.map")
     if(EDEN_PS5_VULKAN AND EDEN_VULKAN_DRIVER STREQUAL "RADV")
+        # The driver checkouts' folder, as tools/radv-refs.sh finds it (EDEN_RADV_REFS,
+        # .local/radv-refs, else the port's parent).
+        set(eden_radv_refs "")
+        if(DEFINED ENV{EDEN_RADV_REFS} AND NOT "$ENV{EDEN_RADV_REFS}" STREQUAL "")
+            set(eden_radv_refs "$ENV{EDEN_RADV_REFS}")
+        elseif(EXISTS "${PORT_ROOT}/.local/radv-refs")
+            file(STRINGS "${PORT_ROOT}/.local/radv-refs" eden_radv_refs LIMIT_COUNT 1)
+        endif()
+        if(eden_radv_refs STREQUAL "")
+            set(eden_radv_refs "${PORT_ROOT}/..")
+        elseif(NOT IS_ABSOLUTE "${eden_radv_refs}")
+            set(eden_radv_refs "${PORT_ROOT}/${eden_radv_refs}")
+        endif()
         set_property(TARGET eden-headless APPEND PROPERTY LINK_DEPENDS
             "${PORT_ROOT}/tools/radv-link-eden.sh"
-            "${PORT_ROOT}/../mihawk-vulkan-review/tools/radv-link.sh")
+            "${eden_radv_refs}/mihawk-vulkan-review/tools/radv-link.sh")
     endif()
     target_compile_definitions(common PRIVATE PS5_NATIVE=1)
 else()

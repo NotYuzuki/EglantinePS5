@@ -29,7 +29,7 @@ link = (build/'bin/eden-headless.map').read_text()
 assert 'heap_wrap' not in link, 'A second SDK heap wrapper owner was linked'
 assert 'libps5vk.a' not in link and 'libpsbc.a' not in link, 'Old Vulkan implementation linked'
 assert 'libvulkan_radeon.ps5.a' in link and 'libps5_opengl_core33.a' in link
-sdk = root.parent/'mihawk-vulkan-review/.deps/native/ps5-payload-sdk'
+sdk = __import__('runpy').run_path(str(root/'tools/radv_refs.py'))['radv_refs'](root)/'mihawk-vulkan-review/.deps/native/ps5-payload-sdk'
 for name in ('libc++.a', 'libc++abi.a', 'libunwind.a'):
     subprocess.run(['cmp', str(cache/'sdk/target/lib'/name), str(sdk/'target/lib'/name)], check=True)
 crt = (build/'headless/radv_app_crt.cpp').read_text()

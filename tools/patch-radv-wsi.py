@@ -5,8 +5,10 @@ import hashlib
 import sys
 
 root = Path(__file__).resolve().parents[1]
-source = root.parent/'mihawk-mesa-review/src/vulkan/wsi/wsi_common_videoout.c'
-target = root.parent/'mihawk-vulkan-review/.deps/work/radv-src/src/vulkan/wsi/wsi_common_videoout.c'
+# The driver checkouts' folder (tools/radv_refs.py: EDEN_RADV_REFS, .local/radv-refs).
+refs = __import__('runpy').run_path(str(root/'tools/radv_refs.py'))['radv_refs'](root)
+source = refs/'mihawk-mesa-review/src/vulkan/wsi/wsi_common_videoout.c'
+target = refs/'mihawk-vulkan-review/.deps/work/radv-src/src/vulkan/wsi/wsi_common_videoout.c'
 text = source.read_text()
 
 def replace(old, new):
@@ -67,7 +69,7 @@ if changed:
     target.write_text(text)
     # Upstream caches the whole build by pin. Invalidate only that receipt;
     # Ninja retains all unchanged objects and rebuilds the patched WSI.
-    provenance = root.parent/'mihawk-vulkan-review/.deps/native/radv-release/PROVENANCE.txt'
+    provenance = refs/'mihawk-vulkan-review/.deps/native/radv-release/PROVENANCE.txt'
     if provenance.exists():
         provenance.replace(provenance.with_suffix('.base.txt'))
 if not checking:
@@ -170,8 +172,8 @@ radv_ps5_memory_grant_gpu(void *address, uint64_t bytes)
          '         return NULL;\n      radv_ps5_tally_add(RADV_PS5_TALLY_SUBMISSION, (int64_t)claim->dedicated.bytes);\n      queue->in_flight_count++;'),
     ],
 }.items():
-    original = root.parent/'mihawk-mesa-review'/relative
-    destination = root.parent/'mihawk-vulkan-review/.deps/work/radv-src'/relative
+    original = refs/'mihawk-mesa-review'/relative
+    destination = refs/'mihawk-vulkan-review/.deps/work/radv-src'/relative
     adapted = original.read_text()
     for old, new in replacements:
         assert adapted.count(old) == 1, f'Pinned initialization anchor changed: {relative}'
@@ -183,7 +185,7 @@ radv_ps5_memory_grant_gpu(void *address, uint64_t bytes)
         continue
     if destination.read_text() != adapted:
         destination.write_text(adapted)
-        provenance = root.parent/'mihawk-vulkan-review/.deps/native/radv-release/PROVENANCE.txt'
+        provenance = refs/'mihawk-vulkan-review/.deps/native/radv-release/PROVENANCE.txt'
         if provenance.exists():
             provenance.replace(provenance.with_suffix('.base.txt'))
     print(f'RADV initialization diagnostic {relative} sha256={hashlib.sha256(adapted.encode()).hexdigest()}')
