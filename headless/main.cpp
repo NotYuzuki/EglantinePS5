@@ -575,6 +575,10 @@ int main(int argc, char** argv) {
         launch_error.clear();
         if (!rooms.BeginGame()) throw std::runtime_error("Join a room successfully or leave it before starting a game.");
         SCOPE_EXIT { rooms.EndGame(); };
+        // texture-budget-log.txt: the texture cache's memory, marks and holdings every 300 frames
+        // (EDEN_VULKAN_TEXTURE_BUDGET, EDEN_VULKAN_TEXTURE_HELD), in release builds too.
+        if (std::filesystem::exists(Eden::AppFile("texture-budget-log.txt")))
+            Eden::Performance::texture_budget_log = true;
 #ifdef EDEN_DEV_VULKAN
         Eden::Performance::vulkan_cost_enabled = std::filesystem::exists(Eden::AppFile("cost-run.txt"));
         const bool performance_run = std::filesystem::exists(Eden::AppFile("performance-run.txt"));

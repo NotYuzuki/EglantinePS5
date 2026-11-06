@@ -1057,6 +1057,43 @@ for signature, index in (
                         static_cast<unsigned long long>(critical_memory),
                         int(Eden::Performance::gc_keep_dirty.load(std::memory_order_relaxed)),
                         int(Eden::Performance::graphics_memory_short.load(std::memory_order_relaxed)));
+        // What the cache holds (console file texture-budget-log.txt): every image by the device
+        // memory it has, the part the GPU wrote (copied back before it can go), and the part the
+        // collector may take at all (unused for 10 frames, its shortest age); the rest of the
+        // driver's figure is buffers, staging and the driver's own.
+        if (!cost_timer && frame_tick % 300 == 0) {
+            const auto Bytes = [](const Image& image) -> u64 {
+                if constexpr (requires { image.MemoryBlock(); }) {
+                    if (const auto block = image.MemoryBlock(); block.size != 0) return block.size;
+                }
+                return image.unswizzled_size_bytes;
+            };
+            u64 images = 0, image_bytes = 0, dirty = 0, dirty_bytes = 0;
+            for (const auto [image_id, image] : slot_images) {
+                ++images;
+                image_bytes += Bytes(*image);
+                if (IsDownloadable(*image)) {
+                    ++dirty;
+                    dirty_bytes += Bytes(*image);
+                }
+            }
+            u64 old_images = 0, old_bytes = 0, old_dirty_bytes = 0, old_costly_bytes = 0;
+            lru_cache.ForEachItemBelow(frame_tick - 10, [&](ImageId image_id) {
+                const auto& image = slot_images[image_id];
+                ++old_images;
+                old_bytes += Bytes(image);
+                if (IsDownloadable(image)) old_dirty_bytes += Bytes(image);
+                if (True(image.flags & ImageFlagBits::CostlyLoad)) old_costly_bytes += Bytes(image);
+            });
+            std::printf("EDEN_VULKAN_TEXTURE_HELD frame=%llu images=%llu/%lluMiB gpu_written=%llu/%lluMiB "
+                        "unused_10_frames=%llu/%lluMiB (gpu_written %lluMiB, costly %lluMiB)\\n",
+                        static_cast<unsigned long long>(frame_tick),
+                        static_cast<unsigned long long>(images), static_cast<unsigned long long>(image_bytes >> 20),
+                        static_cast<unsigned long long>(dirty), static_cast<unsigned long long>(dirty_bytes >> 20),
+                        static_cast<unsigned long long>(old_images), static_cast<unsigned long long>(old_bytes >> 20),
+                        static_cast<unsigned long long>(old_dirty_bytes >> 20),
+                        static_cast<unsigned long long>(old_costly_bytes >> 20));
+        }
     }
 '''
     texture_costs.append((anchor, anchor + scope))
