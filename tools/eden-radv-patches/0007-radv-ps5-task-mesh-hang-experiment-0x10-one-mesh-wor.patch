@@ -1,0 +1,107 @@
+From 460d4c90748267c5868a0734ee67b44e2bf5207d Mon Sep 17 00:00:00 2001
+From: exploitizm <351399878+exploitizm@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 14:07:46 +1000
+Subject: [PATCH] radv/ps5: task+mesh hang experiment 0x10, one mesh workgroup
+ per task workgroup
+
+The records prepass of an emulated task chunk launches at most one mesh
+workgroup (or its parts) per record when /data/eglantineps5/radv-task-emu.txt
+has 0x10: Ocarina of Time's hang is in a chunk's mesh draw, whose records
+launch several (2, 11).
+---
+ src/amd/vulkan/meta/radv_meta_mesh_draw.c |  7 +++++--
+ src/amd/vulkan/nir/radv_meta_nir.c        | 10 +++++++---
+ src/amd/vulkan/radv_cmd_buffer.c          |  7 ++++---
+ src/amd/vulkan/radv_cmd_buffer.h          |  3 +++
+ 4 files changed, 19 insertions(+), 8 deletions(-)
+
+diff --git a/src/amd/vulkan/meta/radv_meta_mesh_draw.c b/src/amd/vulkan/meta/radv_meta_mesh_draw.c
+index 1c9f9e3..ebbe5fb 100644
+--- a/src/amd/vulkan/meta/radv_meta_mesh_draw.c
++++ b/src/amd/vulkan/meta/radv_meta_mesh_draw.c
+@@ -79,7 +79,7 @@ radv_meta_mesh_draw_records(struct radv_cmd_buffer *cmd_buffer, uint64_t indirec
+       records_va = radv_buffer_get_va(cmd_buffer->upload.upload_bo) + offset;
+    }
+ 
+-   VkResult result = get_pipeline(device, RADV_META_OBJECT_KEY_MESH_DRAW_RECORDS, 48,
++   VkResult result = get_pipeline(device, RADV_META_OBJECT_KEY_MESH_DRAW_RECORDS, 52,
+                                   radv_meta_nir_build_mesh_draw_records_cs, &pipeline, &layout);
+    if (result != VK_SUCCESS) {
+       vk_command_buffer_set_error(&cmd_buffer->vk, result);
+@@ -93,9 +93,12 @@ radv_meta_mesh_draw_records(struct radv_cmd_buffer *cmd_buffer, uint64_t indirec
+ 
+    /* The ring is in the 32-bit window. */
+    assert(publish_ring >> 32 == 0 || (publish_ring >> 32) == radv_device_physical(device)->info.address32_hi);
+-   const uint32_t constants[12] = {
++   /* The most workgroups a record launches: a task+mesh hang experiment (radv_ps5_task_emu_debug). */
++   const uint32_t limit = task_rings && (radv_ps5_task_emu_debug() & 0x10) ? parts : UINT32_MAX;
++   const uint32_t constants[13] = {
+       indirect_va,    indirect_va >> 32, records_va, records_va >> 32, count_va,   count_va >> 32,
+       stride,         max_count,         parts,      publish_ring,     task_rings, task_draw_id,
++      limit,
+    };
+    radv_meta_push_constants(cmd_buffer, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(constants), constants);
+ 
+diff --git a/src/amd/vulkan/nir/radv_meta_nir.c b/src/amd/vulkan/nir/radv_meta_nir.c
+index 5a01044..45b1887 100644
+--- a/src/amd/vulkan/nir/radv_meta_nir.c
++++ b/src/amd/vulkan/nir/radv_meta_nir.c
+@@ -1440,9 +1440,13 @@ static void
+ mesh_draw_record(nir_builder *b, nir_def *draw, nir_def *records_addr, nir_def *parts, nir_def *ring,
+                  nir_def *first_workgroup, nir_def *grid, nir_def *task_rings, nir_def *task_draw_id)
+ {
+-   /* A vertex launches a workgroup, or each of its parts. */
+-   nir_def *vertices = nir_imul(b, nir_imul(b, nir_channel(b, grid, 0), nir_channel(b, grid, 1)),
+-                                nir_imul(b, nir_channel(b, grid, 2), parts));
++   /* A vertex launches a workgroup, or each of its parts; at most the limit
++    * (radv_meta_mesh_draw_records). */
++   nir_def *limit = nir_load_push_constant(b, 1, 32, nir_imm_int(b, 0), .base = 48, .range = 4);
++   nir_def *vertices = nir_umin(b,
++                                nir_imul(b, nir_imul(b, nir_channel(b, grid, 0), nir_channel(b, grid, 1)),
++                                         nir_imul(b, nir_channel(b, grid, 2), parts)),
++                                limit);
+    nir_def *zero = nir_imm_int(b, 0);
+ 
+    nir_def *record_addr =
+diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
+index 4fae98c..b9bb848 100644
+--- a/src/amd/vulkan/radv_cmd_buffer.c
++++ b/src/amd/vulkan/radv_cmd_buffer.c
+@@ -15442,8 +15442,9 @@ extern uint64_t radv_ps5_task_emu_note[8];
+ /* Experiments for a task+mesh hang, read once from /data/eglantineps5/radv-task-emu.txt (a hex
+  * mask): 1 waits for the GPU to go idle after each chunk's mesh draw, 2 turns occlusion counting
+  * off during emulated task draws, 8 leaves the mesh draws out (the task dispatches and the records
+- * prepass still run). */
+-static uint32_t
++ * prepass still run), 0x10 launches at most one mesh workgroup per task workgroup
++ * (radv_meta_mesh_draw_records). */
++uint32_t
+ radv_ps5_task_emu_debug(void)
+ {
+    static int mask = -1;
+@@ -15462,7 +15463,7 @@ radv_ps5_task_emu_debug(void)
+    return (uint32_t)mask;
+ }
+ #else
+-static inline uint32_t
++uint32_t
+ radv_ps5_task_emu_debug(void)
+ {
+    return 0;
+diff --git a/src/amd/vulkan/radv_cmd_buffer.h b/src/amd/vulkan/radv_cmd_buffer.h
+index 93d3af3..1e03a40 100644
+--- a/src/amd/vulkan/radv_cmd_buffer.h
++++ b/src/amd/vulkan/radv_cmd_buffer.h
+@@ -702,6 +702,9 @@ radv_cmdbuf_has_stage(const struct radv_cmd_buffer *cmd_buffer, mesa_shader_stag
+    return !!(cmd_buffer->state.active_stages & mesa_to_vk_shader_stage(stage));
+ }
+ 
++/* radv_cmd_buffer.c: the task+mesh hang experiments (PS5). */
++uint32_t radv_ps5_task_emu_debug(void);
++
+ static inline uint32_t
+ radv_get_num_pipeline_stat_queries(struct radv_cmd_buffer *cmd_buffer)
+ {
+-- 
+2.53.0
+
