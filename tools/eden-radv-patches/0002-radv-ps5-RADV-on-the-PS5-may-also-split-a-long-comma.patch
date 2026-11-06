@@ -1,0 +1,122 @@
+From def3fa14bd7dc297d9a4f5941fc94733bbcabdfd Mon Sep 17 00:00:00 2001
+From: Oliv3rmoon <oliv3rmoon@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 12:46:08 -0700
+Subject: [PATCH 2/4] radv/ps5: RADV on the PS5 may also split a long command
+ stream before a transfer or a barrier.
+
+One AGC submission carries at most about a million words, and each starts from reset GPU state,
+so a stream is split only where its state can be re-emitted: radv_split_cmd_stream_if_due, which
+RADV called before draws and dispatches only. A game that loads a new area records long runs of
+buffer uploads, copies and barriers with hardly a draw between them; such a run grew past one
+submission with nowhere to split it, and the winsys gave up ("a submission holds more words
+between two splits than one AGC submission can", then VK_ERROR_DEVICE_LOST). The same check now
+runs where a transfer command or a barrier starts, under the same conditions as before a draw.
+Applied to the driver checkout after patch-radv-disk-cache.py; running it again changes nothing.
+
+From Nightshade tools/patch-radv-transfer-split.py.
+
+(cherry picked from commit 9d73715bd1a4abe9fa3a30d3c4feaacb6cee4123)
+---
+ src/amd/vulkan/meta/radv_meta_buffer.c | 4 ++++
+ src/amd/vulkan/meta/radv_meta_copy.c   | 4 ++++
+ src/amd/vulkan/radv_cmd_buffer.c       | 5 ++++-
+ 3 files changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/src/amd/vulkan/meta/radv_meta_buffer.c b/src/amd/vulkan/meta/radv_meta_buffer.c
+index 559272a..10c7125 100644
+--- a/src/amd/vulkan/meta/radv_meta_buffer.c
++++ b/src/amd/vulkan/meta/radv_meta_buffer.c
+@@ -11,6 +11,7 @@
+ #include "tools/radv_debug_hang.h"
+ #include "radv_cp_dma.h"
+ #include "radv_meta.h"
++void radv_split_cmd_stream_if_due(struct radv_cmd_buffer *cmd_buffer);
+ #include "radv_sdma.h"
+ #include "radv_tracepoints.h"
+ #include "vk_shader_module.h"
+@@ -325,6 +326,7 @@ radv_CmdFillBuffer(VkCommandBuffer commandBuffer, VkBuffer dstBuffer, VkDeviceSi
+                    uint32_t data)
+ {
+    VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
++   radv_split_cmd_stream_if_due(cmd_buffer); /* ProsperoEden: tools/patch-radv-transfer-split.py */
+    VK_FROM_HANDLE(radv_buffer, dst_buffer, dstBuffer);
+ 
+    radv_suspend_conditional_rendering(cmd_buffer);
+@@ -381,6 +383,7 @@ VKAPI_ATTR void VKAPI_CALL
+ radv_CmdCopyBuffer2(VkCommandBuffer commandBuffer, const VkCopyBufferInfo2 *pCopyBufferInfo)
+ {
+    VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
++   radv_split_cmd_stream_if_due(cmd_buffer); /* ProsperoEden: tools/patch-radv-transfer-split.py */
+    VK_FROM_HANDLE(radv_buffer, src_buffer, pCopyBufferInfo->srcBuffer);
+    VK_FROM_HANDLE(radv_buffer, dst_buffer, pCopyBufferInfo->dstBuffer);
+    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+@@ -481,6 +484,7 @@ radv_CmdUpdateBuffer(VkCommandBuffer commandBuffer, VkBuffer dstBuffer, VkDevice
+                      const void *pData)
+ {
+    VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
++   radv_split_cmd_stream_if_due(cmd_buffer); /* ProsperoEden: tools/patch-radv-transfer-split.py */
+    VK_FROM_HANDLE(radv_buffer, dst_buffer, dstBuffer);
+    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+    const uint64_t dst_va = vk_buffer_address(&dst_buffer->vk, dstOffset);
+diff --git a/src/amd/vulkan/meta/radv_meta_copy.c b/src/amd/vulkan/meta/radv_meta_copy.c
+index b48ad04..99627ed 100644
+--- a/src/amd/vulkan/meta/radv_meta_copy.c
++++ b/src/amd/vulkan/meta/radv_meta_copy.c
+@@ -6,6 +6,7 @@
+ 
+ #include "radv_formats.h"
+ #include "radv_meta.h"
++void radv_split_cmd_stream_if_due(struct radv_cmd_buffer *cmd_buffer);
+ #include "radv_sdma.h"
+ #include "vk_format.h"
+ 
+@@ -296,6 +297,7 @@ VKAPI_ATTR void VKAPI_CALL
+ radv_CmdCopyBufferToImage2(VkCommandBuffer commandBuffer, const VkCopyBufferToImageInfo2 *pCopyBufferToImageInfo)
+ {
+    VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
++   radv_split_cmd_stream_if_due(cmd_buffer); /* ProsperoEden: tools/patch-radv-transfer-split.py */
+    VK_FROM_HANDLE(radv_buffer, src_buffer, pCopyBufferToImageInfo->srcBuffer);
+    VK_FROM_HANDLE(radv_image, dst_image, pCopyBufferToImageInfo->dstImage);
+    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+@@ -508,6 +510,7 @@ VKAPI_ATTR void VKAPI_CALL
+ radv_CmdCopyImageToBuffer2(VkCommandBuffer commandBuffer, const VkCopyImageToBufferInfo2 *pCopyImageToBufferInfo)
+ {
+    VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
++   radv_split_cmd_stream_if_due(cmd_buffer); /* ProsperoEden: tools/patch-radv-transfer-split.py */
+    VK_FROM_HANDLE(radv_image, src_image, pCopyImageToBufferInfo->srcImage);
+    VK_FROM_HANDLE(radv_buffer, dst_buffer, pCopyImageToBufferInfo->dstBuffer);
+    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+@@ -801,6 +804,7 @@ VKAPI_ATTR void VKAPI_CALL
+ radv_CmdCopyImage2(VkCommandBuffer commandBuffer, const VkCopyImageInfo2 *pCopyImageInfo)
+ {
+    VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
++   radv_split_cmd_stream_if_due(cmd_buffer); /* ProsperoEden: tools/patch-radv-transfer-split.py */
+    VK_FROM_HANDLE(radv_image, src_image, pCopyImageInfo->srcImage);
+    VK_FROM_HANDLE(radv_image, dst_image, pCopyImageInfo->dstImage);
+    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
+index 3448120..7222622 100644
+--- a/src/amd/vulkan/radv_cmd_buffer.c
++++ b/src/amd/vulkan/radv_cmd_buffer.c
+@@ -13929,7 +13929,9 @@ radv_bind_graphics_shaders(struct radv_cmd_buffer *cmd_buffer)
+  * kept: the submission after the split starts with the same preamble. State
+  * that re-emission does not restore (streamout, conditional rendering, active
+  * queries, an inherited render pass) defers the split until it ends. */
+-static void
++void radv_split_cmd_stream_if_due(struct radv_cmd_buffer *cmd_buffer);
++
++void
+ radv_split_cmd_stream_if_due(struct radv_cmd_buffer *cmd_buffer)
+ {
+    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+@@ -17364,6 +17366,7 @@ VKAPI_ATTR void VKAPI_CALL
+ radv_CmdPipelineBarrier2(VkCommandBuffer commandBuffer, const VkDependencyInfo *pDependencyInfo)
+ {
+    VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
++   radv_split_cmd_stream_if_due(cmd_buffer); /* ProsperoEden: tools/patch-radv-transfer-split.py */
+    enum rgp_barrier_reason barrier_reason;
+ 
+    if (cmd_buffer->vk.runtime_rp_barrier) {
+-- 
+2.53.0
+
