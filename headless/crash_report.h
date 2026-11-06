@@ -82,6 +82,10 @@ Last TakeLast(const std::string& logs_folder, const std::string& eden_log);
 // Once, on the main thread, when stderr and stdout go to their log files.
 void Install(const std::string& logs_folder, const char* version, bool restarted);
 
+// The driver found its GPU stopped (eden_gpu_stalled, below): a crash from here on closes the app
+// instead of starting it again on that GPU.
+void NoteGpuStalled() noexcept;
+
 // What is running, one line for the report. A game the user started also ends the watch for a
 // crash right after a restart (which closes the app instead of starting it over and over).
 void SetSession(const std::string& text, bool game) noexcept;
