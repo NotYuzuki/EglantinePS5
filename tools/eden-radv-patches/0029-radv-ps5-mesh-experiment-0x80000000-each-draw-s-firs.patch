@@ -1,0 +1,73 @@
+From 0f766308af0aefebab153dde600f988a8a7b4c5c Mon Sep 17 00:00:00 2001
+From: exploitizm <351399878+exploitizm@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 21:02:43 +1000
+Subject: [PATCH] radv/ps5: mesh experiment 0x80000000, each draw's first
+ workgroup left out (with 0x2000000)
+
+Run 21:01 (0x64008001), the exports captured: with the unnamed vertices cut
+and filled every exported vertex is named, and the second chunk (workgroups
+of 64 primitives on 64 vertices and 43 on 43) still hangs. Leaving out each
+record's first workgroup tells which of the two does.
+---
+ src/amd/vulkan/meta/radv_meta_mesh_draw.c | 2 +-
+ src/amd/vulkan/nir/radv_meta_nir.c        | 6 +++++-
+ src/amd/vulkan/radv_cmd_buffer.c          | 3 ++-
+ 3 files changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/src/amd/vulkan/meta/radv_meta_mesh_draw.c b/src/amd/vulkan/meta/radv_meta_mesh_draw.c
+index 7edc01c..3c9def7 100644
+--- a/src/amd/vulkan/meta/radv_meta_mesh_draw.c
++++ b/src/amd/vulkan/meta/radv_meta_mesh_draw.c
+@@ -102,7 +102,7 @@ radv_meta_mesh_draw_records(struct radv_cmd_buffer *cmd_buffer, uint64_t indirec
+    const uint32_t constants[16] = {
+       indirect_va,    indirect_va >> 32, records_va, records_va >> 32, count_va,   count_va >> 32,
+       stride,         max_count,         parts,      publish_ring,     task_rings, task_draw_id,
+-      limit,          count_out ? (radv_task_emu_splits(device, task_rings) ? 2u : 1u) : 0u, count_out, count_out >> 32,
++      limit,          count_out ? (radv_task_emu_splits(device, task_rings) ? ((radv_ps5_task_emu_debug() & 0x80000000) ? 3u : 2u) : 1u) : 0u, count_out, count_out >> 32,
+    };
+    radv_meta_push_constants(cmd_buffer, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(constants), constants);
+ 
+diff --git a/src/amd/vulkan/nir/radv_meta_nir.c b/src/amd/vulkan/nir/radv_meta_nir.c
+index 1cfb78d..edf9389 100644
+--- a/src/amd/vulkan/nir/radv_meta_nir.c
++++ b/src/amd/vulkan/nir/radv_meta_nir.c
+@@ -1512,7 +1512,7 @@ radv_meta_nir_build_mesh_draw_records_cs(void)
+ 
+    /* Split (mode 2, radv_task_emu_splits): a record a mesh workgroup, written in order by one
+     * invocation, each launching its own workgroup (first_workgroup) of its draw's grid. */
+-   nir_push_if(&b, nir_ieq_imm(&b, mode, 2));
++   nir_push_if(&b, nir_uge_imm(&b, mode, 2));
+    {
+       nir_push_if(&b, nir_ieq_imm(&b, global_id, 0));
+       {
+@@ -1534,9 +1534,13 @@ radv_meta_nir_build_mesh_draw_records_cs(void)
+                nir_def *k = nir_load_var(&b, split_wg);
+                nir_def *slot = nir_load_var(&b, split_slots);
+                nir_break_if(&b, nir_ior(&b, nir_uge(&b, k, g), nir_uge_imm(&b, slot, 65536)));
++               /* Mode 3: every workgroup but each draw's first. */
++               nir_def *keep = nir_ior(&b, nir_ine_imm(&b, mode, 3), nir_ine_imm(&b, k, 0));
++               nir_push_if(&b, keep);
+                mesh_draw_record(&b, slot, d, records_addr, parts, ring, nir_u2u64(&b, k), grid, task_rings,
+                                 task_draw_id, nir_imm_true(&b));
+                nir_store_var(&b, split_slots, nir_iadd_imm(&b, slot, 1), 0x1);
++               nir_pop_if(&b, NULL);
+                nir_store_var(&b, split_wg, nir_iadd_imm(&b, k, 1), 0x1);
+             }
+             nir_pop_loop(&b, NULL);
+diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
+index 21037b5..d2efd0e 100644
+--- a/src/amd/vulkan/radv_cmd_buffer.c
++++ b/src/amd/vulkan/radv_cmd_buffer.c
+@@ -15456,7 +15456,8 @@ extern uint64_t radv_ps5_task_emu_note[8];
+  * late alloc, 0x200000 the full CU mask, 0x400000 a parameter export when they have none
+  * (radv_precompute_registers_hw_ngg); 0x800000 draws a direct chunk's records one
+  * DRAW_INDIRECT each; 0x1000000 leaves out the first chunk's mesh draw; 0x2000000 gives every mesh
+- * workgroup its own record and draw (radv_task_emu_splits). */
++ * workgroup its own record and draw (radv_task_emu_splits), and with 0x80000000 leaves out each
++ * draw's first workgroup. */
+ uint32_t
+ radv_ps5_task_emu_debug(void)
+ {
+-- 
+2.53.0
+
