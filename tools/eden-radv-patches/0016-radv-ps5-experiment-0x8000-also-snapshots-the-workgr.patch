@@ -1,0 +1,52 @@
+From 391b4201944683fd3e02eac17e1d74ad1630de84 Mon Sep 17 00:00:00 2001
+From: exploitizm <351399878+exploitizm@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 16:13:34 +1000
+Subject: [PATCH] radv/ps5: experiment 0x8000 also snapshots the workgroups
+ started before each chunk
+
+Run 16:12 (0x8001): only 6 mesh workgroups ever started, and all their 24
+waves reached the end; the stuck draw's record asks for 2. The CP now copies
+the started count before each of the first twelve chunks' mesh draws, so the
+dump says how many the stuck draw launched.
+---
+ src/amd/vulkan/radv_cmd_buffer.c            | 11 +++++++++++
+ src/amd/vulkan/winsys/ps5/radv_ps5_winsys.c |  1 +
+ 2 files changed, 12 insertions(+)
+
+diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
+index 7240fae..ff05f43 100644
+--- a/src/amd/vulkan/radv_cmd_buffer.c
++++ b/src/amd/vulkan/radv_cmd_buffer.c
+@@ -15645,6 +15645,17 @@ radv_task_emu_draw_chunk(struct radv_cmd_buffer *cmd_buffer, const struct radv_t
+ 
+    const uint32_t experiments = radv_ps5_task_emu_debug();
+    radeon_check_space(device->ws, cs->b, 64);
++   if (experiments & 0x8000) {
++      /* The workgroups started before each of the first twelve chunks' mesh draws, next to the
++       * counters (ms_ps5_count). */
++      static uint32_t chunks;
++      const uint32_t n = p_atomic_inc_return(&chunks) - 1;
++      if (n < 12) {
++         const uint64_t counters = radv_buffer_get_va(device->task_emu_bo) + RADV_TASK_EMU_BYTES - 64;
++         ac_emit_cp_copy_data(cs->b, COPY_DATA_SRC_MEM, COPY_DATA_DST_MEM, counters, counters + 16 + 4 * n,
++                              AC_CP_COPY_DATA_WR_CONFIRM, false);
++      }
++   }
+    if (!(experiments & 8)) {
+       radv_emit_indirect_buffer(cs, emu->records_va, false);
+       radv_emit_userdata_address(device, cs, mesh_shader, AC_UD_VS_MS_DRAW_RECORDS, emu->records_va);
+diff --git a/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.c b/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.c
+index 1fe89d4..572b29a 100644
+--- a/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.c
++++ b/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.c
+@@ -599,6 +599,7 @@ radv_ps5_dump_task_emu(void)
+               "radv/ps5 stall: mesh counters: %u workgroups started, %u waves at the finale, %u waves at its end"
+               " (workgroup %u lanes, wave %u)\n",
+               counts[0], counts[1], counts[2], (unsigned)((t[4] >> 32) & 0xffff), (unsigned)(t[4] >> 48));
++   radv_ps5_dump_words("workgroups started before chunk 0..11", counters + 16, 12);
+    fflush(stderr);
+ }
+ 
+-- 
+2.53.0
+
