@@ -127,10 +127,10 @@
     },
     {
       "name": "ps5-mesa",
-      "about": "Mihawk's PS5 Mesa (RADV) source: his main at f5610fe2709 with Belladonna's 76c71a05f54, 9d73715bd1a and 318deb146da (Oliv3rmoon/Belladonna), the stall dump on request, its packet trace and task emulation state, and task+mesh hang experiments (1, 2, 8, 0x10, 0x20, 0x40), and the GFX10 fully-culled workaround for mesh shaders, on branch eden-radv",
+      "about": "Mihawk's PS5 Mesa (RADV) source: his main at f5610fe2709 with Belladonna's 76c71a05f54, 9d73715bd1a and 318deb146da (Oliv3rmoon/Belladonna), the stall dump on request, its packet trace and task emulation state, and task+mesh hang experiments (1, 2, 8, 0x10, 0x20, 0x40, 0x80, 0x100), and the GFX10 fully-culled workaround for mesh shaders, on branch eden-radv",
       "kind": "git",
       "url": "https://github.com/mihawk-99/PS5_Mesa.git",
-      "commit": "873719e3fab7e97aafe20f586286db53a459cbb7",
+      "commit": "2473a5ac2498a570d1e2f2596dd8b0e9cee1e924",
       "path": "../mihawk-mesa-review"
     },
     {
