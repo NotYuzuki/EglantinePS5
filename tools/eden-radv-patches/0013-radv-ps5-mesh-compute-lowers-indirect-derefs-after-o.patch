@@ -1,0 +1,45 @@
+From 8b4cdfb897d6acc8b344d034b1da0dff4494d86d Mon Sep 17 00:00:00 2001
+From: exploitizm <351399878+exploitizm@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 15:28:43 +1000
+Subject: [PATCH 13/14] radv/ps5: mesh compute lowers indirect derefs after
+ optimizing, as graphics stages do
+
+Runs 15:18 and 15:27: a pipeline builder ran out of memory in
+nir_opt_copy_prop_vars (the second time with the heap at 0.9 GiB in use and
+the pool not short), compiling Ocarina's mesh shaders without a task shader
+as compute. The compute pass lowered indirect derefs before the first
+optimization loop, which RADV's graphics stages never do: arrays indexed
+by vertex or primitive became if-ladders before they could be optimized,
+and the shader grew past what copy propagation could hold.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/amd/vulkan/radv_mesh_compute.c | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/src/amd/vulkan/radv_mesh_compute.c b/src/amd/vulkan/radv_mesh_compute.c
+index 8c2c0c8..8f18ad7 100644
+--- a/src/amd/vulkan/radv_mesh_compute.c
++++ b/src/amd/vulkan/radv_mesh_compute.c
+@@ -514,9 +514,17 @@ radv_mesh_compute_compile(const struct radv_compiler_info *compiler_info, struct
+    nir->info.max_subgroup_size = 32;
+    NIR_PASS(_, nir, nir_lower_compute_system_values, &compute_sysval_options);
+    NIR_PASS(_, nir, nir_lower_global_vars_to_local);
+-   NIR_PASS(_, nir, ac_nir_lower_indirect_derefs);
+    NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+    radv_optimize_nir(nir, stage.key.optimisations_disabled);
++   /* Indirect derefs after the optimization loop, as the graphics stages have them
++    * (radv_graphics_shaders_compile): lowered first, a mesh shader's arrays indexed by the vertex
++    * or primitive grew it until the copy propagation of variables ran out of memory (Ocarina's
++    * shaders without a task shader). */
++   bool indirect_derefs_lowered = false;
++   NIR_PASS(indirect_derefs_lowered, nir, ac_nir_lower_indirect_derefs);
++   NIR_PASS(_, nir, nir_lower_vars_to_ssa);
++   if (indirect_derefs_lowered && !stage.key.optimisations_disabled)
++      radv_optimize_nir(nir, false);
+    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+ 
+    radv_nir_shader_info_init(MESA_SHADER_COMPUTE, MESA_SHADER_NONE, &stage.info);
+-- 
+2.53.0
+

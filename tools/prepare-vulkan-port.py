@@ -67,8 +67,9 @@ constexpr VkPipelineStageFlags COMPUTE_CONSUMER_STAGES =
 } // namespace
 
 void RasterizerVulkan::DispatchCompute() {"""),
-    ('        scheduler.RequestOutsideRenderPassOperationContext();\n        scheduler.TraceComputePipeline(pipeline->ShaderHash());\n        scheduler.Record([this, pipeline, indirect_buffer = buffer->Handle(),',
+    ('        scheduler.RequestOutsideRenderPassOperationContext();\n        record_read_barrier();\n        scheduler.TraceComputePipeline(pipeline->ShaderHash());\n        scheduler.Record([this, pipeline, indirect_buffer = buffer->Handle(),',
      """        scheduler.RequestOutsideRenderPassOperationContext();
+        record_read_barrier();
         scheduler.TraceComputePipeline(pipeline->ShaderHash());
         if (::Eden::DevVulkan::compute_barriers) {
             scheduler.Record([](vk::CommandBuffer cmdbuf) {
@@ -1057,43 +1058,6 @@ for signature, index in (
                         static_cast<unsigned long long>(critical_memory),
                         int(Eden::Performance::gc_keep_dirty.load(std::memory_order_relaxed)),
                         int(Eden::Performance::graphics_memory_short.load(std::memory_order_relaxed)));
-        // What the cache holds (console file texture-budget-log.txt): every image by the device
-        // memory it has, the part the GPU wrote (copied back before it can go), and the part the
-        // collector may take at all (unused for 10 frames, its shortest age); the rest of the
-        // driver's figure is buffers, staging and the driver's own.
-        if (!cost_timer && frame_tick % 300 == 0) {
-            const auto Bytes = [](const Image& image) -> u64 {
-                if constexpr (requires { image.MemoryBlock(); }) {
-                    if (const auto block = image.MemoryBlock(); block.size != 0) return block.size;
-                }
-                return image.unswizzled_size_bytes;
-            };
-            u64 images = 0, image_bytes = 0, dirty = 0, dirty_bytes = 0;
-            for (const auto [image_id, image] : slot_images) {
-                ++images;
-                image_bytes += Bytes(*image);
-                if (IsDownloadable(*image)) {
-                    ++dirty;
-                    dirty_bytes += Bytes(*image);
-                }
-            }
-            u64 old_images = 0, old_bytes = 0, old_dirty_bytes = 0, old_costly_bytes = 0;
-            lru_cache.ForEachItemBelow(frame_tick - 10, [&](ImageId image_id) {
-                const auto& image = slot_images[image_id];
-                ++old_images;
-                old_bytes += Bytes(image);
-                if (IsDownloadable(image)) old_dirty_bytes += Bytes(image);
-                if (True(image.flags & ImageFlagBits::CostlyLoad)) old_costly_bytes += Bytes(image);
-            });
-            std::printf("EDEN_VULKAN_TEXTURE_HELD frame=%llu images=%llu/%lluMiB gpu_written=%llu/%lluMiB "
-                        "unused_10_frames=%llu/%lluMiB (gpu_written %lluMiB, costly %lluMiB)\\n",
-                        static_cast<unsigned long long>(frame_tick),
-                        static_cast<unsigned long long>(images), static_cast<unsigned long long>(image_bytes >> 20),
-                        static_cast<unsigned long long>(dirty), static_cast<unsigned long long>(dirty_bytes >> 20),
-                        static_cast<unsigned long long>(old_images), static_cast<unsigned long long>(old_bytes >> 20),
-                        static_cast<unsigned long long>(old_dirty_bytes >> 20),
-                        static_cast<unsigned long long>(old_costly_bytes >> 20));
-        }
     }
 '''
     texture_costs.append((anchor, anchor + scope))
@@ -1149,9 +1113,11 @@ adapt('src/video_core/texture_cache/texture_cache.h',
      '        image.UploadMemory(staging, copies);\n',
      '        ConvertImage(unswizzle_data_buffer, image.info, mapped_span, copies);\n'
      '        ::Eden::StagingChunks::UploadStaged(image, staging, copies);\n'),
-    ('        const auto copies = UnswizzleImage(*gpu_memory, gpu_addr, image.info, swizzle_data, mapped_span);\n'
+    ('        const auto copies = UnswizzleImage(*gpu_memory, gpu_addr, image.info, swizzle_data,\n'
+     '                                          mapped_span, 0, &unswizzle_worker);\n'
      '        image.UploadMemory(staging, copies);\n',
-     '        const auto copies = UnswizzleImage(*gpu_memory, gpu_addr, image.info, swizzle_data, mapped_span);\n'
+     '        const auto copies = UnswizzleImage(*gpu_memory, gpu_addr, image.info, swizzle_data,\n'
+     '                                          mapped_span, 0, &unswizzle_worker);\n'
      '        ::Eden::StagingChunks::UploadStaged(image, staging, copies);\n'),
     # An ASTC texture decoded in the background is in the heap already: staged in pieces too.
     ('        auto staging = runtime.UploadStagingBuffer(MapSizeBytes(image));\n'
@@ -1309,10 +1275,10 @@ configure_phases = [
      '    // Descriptor queue acquired, image descriptors pushed, uploads barriered.\n'
      '    ::Eden::Performance::Mark(::Eden::Performance::cfg_desc, since);\n'
      '    texture_cache.UpdateRenderTargets(false);'),
-    ('    if (IsBuilt() && !pipeline) {',
+    ('    if (IsBuilt() && (!pipeline || build->Failed())) {',
      '    // Render targets current, feedback loops checked.\n'
      '    ::Eden::Performance::Mark(::Eden::Performance::cfg_rt, since);\n'
-     '    if (IsBuilt() && !pipeline) {'),
+     '    if (IsBuilt() && (!pipeline || build->Failed())) {'),
     ('    return ConfigureDraw(rescaling, render_area);',
      '    // Compare the descriptor payload against last draw\'s and record the bindings.\n'
      '    const bool configured = ConfigureDraw(rescaling, render_area);\n'
@@ -1320,10 +1286,13 @@ configure_phases = [
      '    return configured;'),
 ]
 for name in ('vk_graphics_pipeline', 'vk_compute_pipeline'):
+    # The draw's or dispatch's wait for its pipeline's build: Lichii's graphics pipelines wait in
+    # their build (build->Wait), compute ones still on the build mutex.
+    build_wait = ('            build->Wait(!worker_only_build);' if name == 'vk_graphics_pipeline'
+                  else '            std::unique_lock lock{build_mutex};')
     anchors = [
         ('#include <algorithm>', '#include <algorithm>\n#include "performance.h"'),
-        ('            std::unique_lock lock{build_mutex};',
-         '            auto timer = Eden::Performance::VulkanTimer(16);\n            std::unique_lock lock{build_mutex};'),
+        (build_wait, '            auto timer = Eden::Performance::VulkanTimer(16);\n' + build_wait),
     ]
     if name == 'vk_graphics_pipeline':
         anchors += configure_phases
@@ -1454,6 +1423,14 @@ shader_costs.append((
     '        }\n'
     '    }\n'
     '    // Text log + .spv dump. Same split as the graphics path.'))
+# Pipeline builders: at most 4 on the console. Each holds a pipeline's compiler memory, and a
+# session that starts with an empty shader cache compiles on all of them while the game runs:
+# Ocarina's first session on Lichii 09b78bd2df, with its mesh shaders compiled as compute,
+# reached 1.9 GiB of heap in use in compiles (1.2 before) with the guest holding 4.9 GiB, and an
+# allocation in the compiler failed. Fewer builders: slower first compiles, a bounded peak.
+shader_costs.append((
+    '#else\n    return max_core_threads;\n#endif\n}',
+    '#else\n    return std::min<size_t>(max_core_threads, 4);\n#endif\n}'))
 for old, new in shader_costs:
     if shader_source.count(old) != 1:
         raise RuntimeError(f'Shader pipeline anchor changed: {old[:60]}')
@@ -1528,7 +1505,7 @@ probes = {
     ],
 }
 for name, index, expected in (
-    ('vk_fence_manager', 6, 1), ('vk_buffer_cache', 7, 4),
+    ('vk_fence_manager', 6, 1), ('vk_buffer_cache', 7, 5),
     ('vk_texture_cache', 8, 2), ('vk_swapchain', 9, 6),
     ('vk_descriptor_buffer', 10, 2), ('vk_multi_range_buffer', 11, 1),
     ('vk_compute_pass', 12, 1),

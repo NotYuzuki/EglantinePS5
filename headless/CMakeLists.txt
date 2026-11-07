@@ -806,14 +806,14 @@ endif()
 # Guest core idle: count each wait and how long it lasted, and spin on the
 # interrupt flag for a bounded time before sleeping on the condition variable, because waking a
 # sleeping host thread puts the host scheduler's latency on the guest's critical path.
-string(FIND "${physical_core_source}" "void PhysicalCore::Idle() {" idle_begin)
+string(FIND "${physical_core_source}" "void PhysicalCore::Idle(KernelCore& kernel) {" idle_begin)
 string(FIND "${physical_core_source}" "bool PhysicalCore::IsInterrupted() const {" idle_end)
 if(idle_begin LESS 0 OR idle_end LESS idle_begin)
     message(FATAL_ERROR "Pinned PhysicalCore::Idle changed")
 endif()
 math(EXPR idle_length "${idle_end} - ${idle_begin}")
 string(SUBSTRING "${physical_core_source}" ${idle_begin} ${idle_length} idle_old)
-string(REPLACE "${idle_old}" [=[void PhysicalCore::Idle() {
+string(REPLACE "${idle_old}" [=[void PhysicalCore::Idle([[maybe_unused]] KernelCore& kernel) {
     const long long start = ::Eden::Performance::NowNs();
     const unsigned spins = ::Eden::Performance::idle_spin_iterations.load(std::memory_order_relaxed);
     for (unsigned i = 0; i < spins && !m_is_interrupted.load(std::memory_order_acquire); ++i)
