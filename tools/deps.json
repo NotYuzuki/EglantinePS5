@@ -127,10 +127,10 @@
     },
     {
       "name": "ps5-mesa",
-      "about": "Mihawk's PS5 Mesa (RADV) source: his main at f5610fe2709 with Belladonna's 76c71a05f54, 9d73715bd1a and 318deb146da (Oliv3rmoon/Belladonna), the stall dump on request and its packet trace, the GFX10 fully-culled workaround for mesh shaders, mesh shaders of emulated task draws as compute, Belladonna's 0566926 (the disk shader cache whatever ids the app runs with), those pipelines cached, and their buffer at 16 MiB with empty passes skipped, on branch eden-radv (tools/eden-radv-patches)",
+      "about": "Mihawk's PS5 Mesa (RADV) source: his main at f5610fe2709 with Belladonna's 76c71a05f54, 9d73715bd1a and 318deb146da (Oliv3rmoon/Belladonna), the stall dump on request and its packet trace, the GFX10 fully-culled workaround for mesh shaders, mesh shaders of emulated task draws as compute, Belladonna's 0566926 (the disk shader cache whatever ids the app runs with), those pipelines cached, their buffer at 16 MiB with empty passes skipped, and mesh shaders without a task shader as compute too, on branch eden-radv (tools/eden-radv-patches)",
       "kind": "git",
       "url": "https://github.com/exploitizm/PS5_Mesa.git",
-      "commit": "6faf9824b98a62bceb8dc906185326047d152775",
+      "commit": "f24ad5c74d1159c9df940ea760c5b1182c2c773b",
       "path": "../mihawk-mesa-review"
     },
     {

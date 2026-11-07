@@ -24,11 +24,17 @@ mesh shaders on GFX10.3 only. No register setting found avoids it.
 
 ## How
 
-Never run a mesh shader of an emulated task draw on the NGG mesh path: run it as compute writing
+Never run a mesh shader on the NGG mesh path, with an emulated task shader or without one: run it
+as compute writing
 its outputs to memory, and rasterize them through an ordinary vertex shader (the path every other
 draw uses). Mesa's Asahi driver and this fork's `RADV_GS_COMPUTE` (geometry shaders NGG cannot
 run) do the same. The driver change is `eden-radv` 0008 (`tools/eden-radv-patches`,
-`src/amd/vulkan/radv_mesh_compute.c`).
+`src/amd/vulkan/radv_mesh_compute.c`), with 0010 to 0014 after it.
+
+A mesh draw without a task shader (on this GPU a DRAW_INDEX_AUTO of a vertex a mesh workgroup,
+the same NGG launch: it hung Ocarina on the Lichii 09b78bd2df core, eden-radv 0012) goes the same
+way: the records pass reads the draws' own commands, the direct draw's grid uploaded as one, a
+record a draw with its draw ID, and the passes below are the same.
 
 Per emulated task chunk (`radv_mesh_compute_chunk`):
 
@@ -57,9 +63,10 @@ The compute mesh shader runs with the graphics pipeline's descriptors and push c
 
 ## Pipeline
 
-In `radv_graphics_shaders_compile`, beside the GS-compute split, a pipeline with a task and a mesh
-shader on a GPU that emulates task shaders (`radv_task_emulated`) splits the mesh stage
-(`radv_mesh_compute_split`):
+In `radv_graphics_shaders_compile`, beside the GS-compute split, a pipeline with a mesh shader on a
+GPU that emulates task shaders (`radv_task_emulated`) splits the mesh stage
+(`radv_mesh_compute_split`); its compute pass is compiled in the graphics stages' order (indirect
+derefs lowered after the first optimization loop, eden-radv 0013):
 
 - the mesh NIR, lowered (outputs and SetMeshOutputs to stores into the workgroup's slot,
   workgroup ID, grid and draw ID from its record, task payload from the payload ring at its task
@@ -80,8 +87,8 @@ came at 273 s with an empty cache and at 21 s with a full one (eden-radv 0010).
 
 ## Status
 
-Ocarina's mesh shaders take slots of 1.6 to 10.8 KB, 1,551 to 10,485 mesh workgroups a pass
-(the driver logs each pipeline's). The buffer was 128 MiB until empty passes were skipped
+Ocarina's mesh shaders take slots of 1.6 to 10.8 KB, 1,551 to 10,485 mesh workgroups a pass. The
+buffer was 128 MiB until empty passes were skipped
 (eden-radv 0011); the driver's own memory went from 220 to 108 MiB.
 
 On by default. `/data/eglantineps5/radv-mesh-compute.txt` holding `0` turns it off (the NGG mesh
@@ -91,8 +98,13 @@ Ocarina of Time (`0400486024dec000`) plays past the intro and into gameplay, and
 were missing with `EDEN_NX2_NO_MESH` draw. It runs out of memory after a few minutes of gameplay
 at 1x with no mods (`VK_ERROR_OUT_OF_DEVICE_MEMORY`), as it did before this work: the guest's own
 memory (about 6 GB), graphics (about 3.9 GB) and the heap fill the console's 12.4 GB pool. That
-is a separate problem (the texture cache holds only its working set; see
-`texture-budget-log.txt`).
+is a separate problem, the Switch 2 memory one (the texture cache holds only its working set, 1.5
+to 2 GB).
+
+On the Lichii 09b78bd2df core, which shows its first frame in 20 to 40 s and builds pipelines
+while the game plays, that limit comes about 80 s into gameplay, in a pipeline build ("heap
+exhausted"; every mesh compute pass had compiled). The console builds pipelines on at most 4
+threads (`tools/prepare-vulkan-port.py`), which lowers the peak but does not avoid it.
 
 Limits, where a pipeline keeps the hardware path:
 

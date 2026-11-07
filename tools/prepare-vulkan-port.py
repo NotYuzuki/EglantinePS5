@@ -1423,6 +1423,14 @@ shader_costs.append((
     '        }\n'
     '    }\n'
     '    // Text log + .spv dump. Same split as the graphics path.'))
+# Pipeline builders: at most 4 on the console. Each holds a pipeline's compiler memory, and a
+# session that starts with an empty shader cache compiles on all of them while the game runs:
+# Ocarina's first session on Lichii 09b78bd2df, with its mesh shaders compiled as compute,
+# reached 1.9 GiB of heap in use in compiles (1.2 before) with the guest holding 4.9 GiB, and an
+# allocation in the compiler failed. Fewer builders: slower first compiles, a bounded peak.
+shader_costs.append((
+    '#else\n    return max_core_threads;\n#endif\n}',
+    '#else\n    return std::min<size_t>(max_core_threads, 4);\n#endif\n}'))
 for old, new in shader_costs:
     if shader_source.count(old) != 1:
         raise RuntimeError(f'Shader pipeline anchor changed: {old[:60]}')
