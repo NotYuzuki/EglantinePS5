@@ -67,8 +67,9 @@ constexpr VkPipelineStageFlags COMPUTE_CONSUMER_STAGES =
 } // namespace
 
 void RasterizerVulkan::DispatchCompute() {"""),
-    ('        scheduler.RequestOutsideRenderPassOperationContext();\n        scheduler.TraceComputePipeline(pipeline->ShaderHash());\n        scheduler.Record([this, pipeline, indirect_buffer = buffer->Handle(),',
+    ('        scheduler.RequestOutsideRenderPassOperationContext();\n        record_read_barrier();\n        scheduler.TraceComputePipeline(pipeline->ShaderHash());\n        scheduler.Record([this, pipeline, indirect_buffer = buffer->Handle(),',
      """        scheduler.RequestOutsideRenderPassOperationContext();
+        record_read_barrier();
         scheduler.TraceComputePipeline(pipeline->ShaderHash());
         if (::Eden::DevVulkan::compute_barriers) {
             scheduler.Record([](vk::CommandBuffer cmdbuf) {
@@ -1149,9 +1150,11 @@ adapt('src/video_core/texture_cache/texture_cache.h',
      '        image.UploadMemory(staging, copies);\n',
      '        ConvertImage(unswizzle_data_buffer, image.info, mapped_span, copies);\n'
      '        ::Eden::StagingChunks::UploadStaged(image, staging, copies);\n'),
-    ('        const auto copies = UnswizzleImage(*gpu_memory, gpu_addr, image.info, swizzle_data, mapped_span);\n'
+    ('        const auto copies = UnswizzleImage(*gpu_memory, gpu_addr, image.info, swizzle_data,\n'
+     '                                          mapped_span, 0, &unswizzle_worker);\n'
      '        image.UploadMemory(staging, copies);\n',
-     '        const auto copies = UnswizzleImage(*gpu_memory, gpu_addr, image.info, swizzle_data, mapped_span);\n'
+     '        const auto copies = UnswizzleImage(*gpu_memory, gpu_addr, image.info, swizzle_data,\n'
+     '                                          mapped_span, 0, &unswizzle_worker);\n'
      '        ::Eden::StagingChunks::UploadStaged(image, staging, copies);\n'),
     # An ASTC texture decoded in the background is in the heap already: staged in pieces too.
     ('        auto staging = runtime.UploadStagingBuffer(MapSizeBytes(image));\n'
@@ -1309,10 +1312,10 @@ configure_phases = [
      '    // Descriptor queue acquired, image descriptors pushed, uploads barriered.\n'
      '    ::Eden::Performance::Mark(::Eden::Performance::cfg_desc, since);\n'
      '    texture_cache.UpdateRenderTargets(false);'),
-    ('    if (IsBuilt() && !pipeline) {',
+    ('    if (IsBuilt() && (!pipeline || build->Failed())) {',
      '    // Render targets current, feedback loops checked.\n'
      '    ::Eden::Performance::Mark(::Eden::Performance::cfg_rt, since);\n'
-     '    if (IsBuilt() && !pipeline) {'),
+     '    if (IsBuilt() && (!pipeline || build->Failed())) {'),
     ('    return ConfigureDraw(rescaling, render_area);',
      '    // Compare the descriptor payload against last draw\'s and record the bindings.\n'
      '    const bool configured = ConfigureDraw(rescaling, render_area);\n'
@@ -1320,10 +1323,13 @@ configure_phases = [
      '    return configured;'),
 ]
 for name in ('vk_graphics_pipeline', 'vk_compute_pipeline'):
+    # The draw's or dispatch's wait for its pipeline's build: Lichii's graphics pipelines wait in
+    # their build (build->Wait), compute ones still on the build mutex.
+    build_wait = ('            build->Wait(!worker_only_build);' if name == 'vk_graphics_pipeline'
+                  else '            std::unique_lock lock{build_mutex};')
     anchors = [
         ('#include <algorithm>', '#include <algorithm>\n#include "performance.h"'),
-        ('            std::unique_lock lock{build_mutex};',
-         '            auto timer = Eden::Performance::VulkanTimer(16);\n            std::unique_lock lock{build_mutex};'),
+        (build_wait, '            auto timer = Eden::Performance::VulkanTimer(16);\n' + build_wait),
     ]
     if name == 'vk_graphics_pipeline':
         anchors += configure_phases
@@ -1528,7 +1534,7 @@ probes = {
     ],
 }
 for name, index, expected in (
-    ('vk_fence_manager', 6, 1), ('vk_buffer_cache', 7, 4),
+    ('vk_fence_manager', 6, 1), ('vk_buffer_cache', 7, 5),
     ('vk_texture_cache', 8, 2), ('vk_swapchain', 9, 6),
     ('vk_descriptor_buffer', 10, 2), ('vk_multi_range_buffer', 11, 1),
     ('vk_compute_pass', 12, 1),
